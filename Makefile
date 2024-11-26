@@ -94,7 +94,7 @@ $(KERNEL_SOURCES): $(KERNEL_TARBALL)
 	cd $(KERNEL_SOURCES) ; $(MAKE) olddefconfig
 
 $(KERNEL_BINARY_$(GUESTARCH)): $(KERNEL_SOURCES)
-	cd $(KERNEL_SOURCES) ; rm -f .version ; $(MAKE) $(MAKEFLAGS) $(KERNEL_FLAGS)
+	cd $(KERNEL_SOURCES) ; rm -f .version ; $(MAKE) $(KERNEL_FLAGS)
 
 ifeq ($(OS),Darwin)
 $(KERNEL_C_BUNDLE):
