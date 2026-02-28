@@ -1,0 +1,146 @@
+name: Release
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stage 1: Build kernel and .so on Linux
+  # ---------------------------------------------------------------------------
+  build-linux-x86_64:
+    name: Build Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y make gcc bc bison flex elfutils python3-pyelftools curl patch libelf-dev
+
+      - name: Extract version from Makefile
+        id: version
+        run: |
+          echo "abi=$(grep '^ABI_VERSION' Makefile | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+          echo "full=$(grep '^FULL_VERSION' Makefile | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: Build kernel and shared library
+        run: make -j"$(nproc)"
+
+      - name: Upload kernel.c as job artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-c-x86_64
+          path: kernel.c
+          retention-days: 1
+
+      - name: Upload .so to release
+        run: |
+          ABI="${{ steps.version.outputs.abi }}"
+          FULL="${{ steps.version.outputs.full }}"
+          cp "libkrunfw.so.${FULL}" "libkrunfw-linux-x86_64.so.${FULL}"
+          gh release upload "${{ github.event.release.tag_name }}" "libkrunfw-linux-x86_64.so.${FULL}"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  build-linux-aarch64:
+    name: Build Linux aarch64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y make gcc bc bison flex elfutils python3-pyelftools curl patch libelf-dev
+
+      - name: Extract version from Makefile
+        id: version
+        run: |
+          echo "abi=$(grep '^ABI_VERSION' Makefile | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+          echo "full=$(grep '^FULL_VERSION' Makefile | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: Build kernel and shared library
+        run: make -j"$(nproc)"
+
+      - name: Upload kernel.c as job artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-c-aarch64
+          path: kernel.c
+          retention-days: 1
+
+      - name: Upload .so to release
+        run: |
+          ABI="${{ steps.version.outputs.abi }}"
+          FULL="${{ steps.version.outputs.full }}"
+          cp "libkrunfw.so.${FULL}" "libkrunfw-linux-aarch64.so.${FULL}"
+          gh release upload "${{ github.event.release.tag_name }}" "libkrunfw-linux-aarch64.so.${FULL}"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  # ---------------------------------------------------------------------------
+  # Stage 2: Compile .dylib on macOS from kernel.c artifacts
+  # ---------------------------------------------------------------------------
+  build-macos-aarch64:
+    name: Build macOS aarch64
+    runs-on: macos-latest
+    needs: build-linux-aarch64
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version from Makefile
+        id: version
+        run: |
+          echo "abi=$(grep '^ABI_VERSION' Makefile | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+          echo "full=$(grep '^FULL_VERSION' Makefile | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: Download kernel.c artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-c-aarch64
+
+      - name: Compile dylib
+        run: |
+          ABI="${{ steps.version.outputs.abi }}"
+          cc -fPIC -DABI_VERSION="${ABI}" -shared -o "libkrunfw-macos-aarch64.${ABI}.dylib" kernel.c
+
+      - name: Upload .dylib to release
+        run: |
+          ABI="${{ steps.version.outputs.abi }}"
+          gh release upload "${{ github.event.release.tag_name }}" "libkrunfw-macos-aarch64.${ABI}.dylib"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  build-macos-x86_64:
+    name: Build macOS x86_64
+    runs-on: macos-13
+    needs: build-linux-x86_64
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version from Makefile
+        id: version
+        run: |
+          echo "abi=$(grep '^ABI_VERSION' Makefile | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+          echo "full=$(grep '^FULL_VERSION' Makefile | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: Download kernel.c artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-c-x86_64
+
+      - name: Compile dylib
+        run: |
+          ABI="${{ steps.version.outputs.abi }}"
+          cc -fPIC -DABI_VERSION="${ABI}" -shared -o "libkrunfw-macos-x86_64.${ABI}.dylib" kernel.c
+
+      - name: Upload .dylib to release
+        run: |
+          ABI="${{ steps.version.outputs.abi }}"
+          gh release upload "${{ github.event.release.tag_name }}" "libkrunfw-macos-x86_64.${ABI}.dylib"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

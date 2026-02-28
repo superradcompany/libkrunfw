@@ -98,8 +98,8 @@ $(KERNEL_BINARY_$(GUESTARCH)): $(KERNEL_SOURCES)
 
 ifeq ($(OS),Darwin)
 $(KERNEL_C_BUNDLE):
-	@echo "Building on macOS, using ./build_on_krunvm.sh"
-	./build_on_krunvm.sh
+	@echo "Building on macOS, using ./build_in_docker.sh"
+	./build_in_docker.sh
 else
 $(KERNEL_C_BUNDLE): $(KERNEL_BINARY_$(GUESTARCH))
 	@echo "Generating $(KERNEL_C_BUNDLE) from $(KERNEL_BINARY_$(GUESTARCH))..."
