@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Microsandbox <development@superrad.company>
+Date: Sat, 30 May 2026 00:00:00 +0000
+Subject: [PATCH 23/23] msb-krunfw: increase kernel command line size
+
+Microsandbox currently passes early boot configuration through the kernel
+command line while agentd is brought up as PID 1. The stock arch limits are
+too small for moderately large mount or environment payloads, especially on
+arm64 and riscv64.
+
+Raise the supported libkrunfw guest architectures to a shared 16 KiB command
+line limit, and raise the default number of init environment entries to 256.
+This keeps the limits modest for microVM boot while giving microsandbox enough
+headroom until the boot configuration moves to a structured guest-visible
+transport.
+
+Signed-off-by: Microsandbox <development@superrad.company>
+---
+ arch/arm64/include/uapi/asm/setup.h | 2 +-
+ arch/riscv/include/uapi/asm/setup.h | 2 +-
+ arch/x86/include/asm/setup.h        | 2 +-
+ init/Kconfig                        | 2 +-
+ 4 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm64/include/uapi/asm/setup.h b/arch/arm64/include/uapi/asm/setup.h
+index 5d703888f351..a1f39d4d22ac 100644
+--- a/arch/arm64/include/uapi/asm/setup.h
++++ b/arch/arm64/include/uapi/asm/setup.h
+@@ -22,6 +22,6 @@
+ 
+ #include <linux/types.h>
+ 
+-#define COMMAND_LINE_SIZE	2048
++#define COMMAND_LINE_SIZE	16384
+ 
+ #endif
+diff --git a/arch/riscv/include/uapi/asm/setup.h b/arch/riscv/include/uapi/asm/setup.h
+index 66b13a522880..bcfa37d24505 100644
+--- a/arch/riscv/include/uapi/asm/setup.h
++++ b/arch/riscv/include/uapi/asm/setup.h
+@@ -3,6 +3,6 @@
+ #ifndef _UAPI_ASM_RISCV_SETUP_H
+ #define _UAPI_ASM_RISCV_SETUP_H
+ 
+-#define COMMAND_LINE_SIZE	1024
++#define COMMAND_LINE_SIZE	16384
+ 
+ #endif /* _UAPI_ASM_RISCV_SETUP_H */
+diff --git a/arch/x86/include/asm/setup.h b/arch/x86/include/asm/setup.h
+index d8ad242e8d7a..4a36fcd697f4 100644
+--- a/arch/x86/include/asm/setup.h
++++ b/arch/x86/include/asm/setup.h
+@@ -4,7 +4,7 @@
+ 
+ #include <uapi/asm/setup.h>
+ 
+-#define COMMAND_LINE_SIZE 2048
++#define COMMAND_LINE_SIZE 16384
+ 
+ #include <linux/linkage.h>
+ #include <asm/page_types.h>
+diff --git a/init/Kconfig b/init/Kconfig
+index 7e5c3dd9ab1e..083d5076b715 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -172,7 +172,7 @@ config BROKEN_ON_SMP
+ 
+ config INIT_ENV_ARG_LIMIT
+ 	int
+-	default 32 if !UML
++	default 256 if !UML
+ 	default 128 if UML
+ 	help
+ 	  Maximum of each of the number of arguments and environment
+-- 
+2.52.0
