@@ -1,0 +1,353 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Microsandbox <development@superrad.company>
+Date: Tue, 16 Jun 2026 00:00:00 +0000
+Subject: [PATCH 24/24] virtio: add microsandbox upper metrics driver
+
+Add a small built-in virtio driver for microsandbox's private metrics
+device. The driver lets PID 1 register the mounted OCI upper filesystem
+path through a write-once sysfs knob, pins the resolved path, samples
+VFS statfs accounting, and publishes fixed-size upper used/free samples
+to the host over the private virtqueue.
+
+The path registration is intentionally write-once. If a workload later
+obtains guest root, it cannot retarget the reporter to a different mount
+through this knob; it can only affect the metric by actually changing the
+registered filesystem's usage.
+
+Signed-off-by: Microsandbox <development@superrad.company>
+---
+ drivers/virtio/Kconfig             |  10 ++
+ drivers/virtio/Makefile            |   1 +
+ drivers/virtio/virtio_msb_metrics.c | 278 +++++++++++++++++++++++++++
+ include/uapi/linux/virtio_ids.h    |   1 +
+ 4 files changed, 290 insertions(+)
+ create mode 100644 drivers/virtio/virtio_msb_metrics.c
+
+diff --git a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
+index 86c00dc48f34..22c4d7db30ba 100644
+--- a/drivers/virtio/Kconfig
++++ b/drivers/virtio/Kconfig
+@@ -31,6 +31,16 @@ menuconfig VIRTIO_MENU
+ 
+ if VIRTIO_MENU
+ 
++config VIRTIO_MSB_METRICS
++	bool "Microsandbox protected metrics virtio driver"
++	depends on VIRTIO
++	default y
++	help
++	  This driver publishes protected microsandbox guest filesystem metrics
++	  to a private host virtio device. It is intended for bundled
++	  microsandbox kernels; custom kernels may omit it and will simply leave
++	  the corresponding host metrics unavailable.
++
+ config VIRTIO_HARDEN_NOTIFICATION
+         bool "Harden virtio notification"
+         depends on BROKEN
+diff --git a/drivers/virtio/Makefile b/drivers/virtio/Makefile
+index 17721f60e6d5..592a4be5390c 100644
+--- a/drivers/virtio/Makefile
++++ b/drivers/virtio/Makefile
+@@ -14,3 +14,4 @@ obj-$(CONFIG_VIRTIO_VDPA) += virtio_vdpa.o
+ obj-$(CONFIG_VIRTIO_MEM) += virtio_mem.o
+ obj-$(CONFIG_VIRTIO_DMA_SHARED_BUFFER) += virtio_dma_buf.o
+ obj-$(CONFIG_VIRTIO_DEBUG) += virtio_debug.o
++obj-$(CONFIG_VIRTIO_MSB_METRICS) += virtio_msb_metrics.o
+diff --git a/drivers/virtio/virtio_msb_metrics.c b/drivers/virtio/virtio_msb_metrics.c
+new file mode 100644
+index 000000000000..47ed9b8a7ff3
+--- /dev/null
++++ b/drivers/virtio/virtio_msb_metrics.c
+@@ -0,0 +1,278 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Microsandbox protected metrics virtio driver.
++ */
++
++#include <linux/fs.h>
++#include <linux/jiffies.h>
++#include <linux/kobject.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/namei.h>
++#include <linux/path.h>
++#include <linux/scatterlist.h>
++#include <linux/slab.h>
++#include <linux/statfs.h>
++#include <linux/string.h>
++#include <linux/sysfs.h>
++#include <linux/virtio.h>
++#include <linux/virtio_config.h>
++#include <linux/virtio_ids.h>
++
++#define MSB_METRICS_SAMPLE_VERSION 1
++#define MSB_METRICS_SAMPLE_INTERVAL (HZ)
++
++struct msb_metrics_upper_sample {
++	__le32 version;
++	__le32 size;
++	__le64 upper_used_bytes;
++	__le64 upper_free_bytes;
++} __packed;
++
++struct msb_metrics_dev {
++	struct virtio_device *vdev;
++	struct virtqueue *vq;
++	struct mutex lock; /* Protects upper_path and sample queueing. */
++	struct delayed_work sample_work;
++	struct path upper_path;
++	bool upper_path_registered;
++	struct msb_metrics_upper_sample sample;
++};
++
++static struct kobject *msb_metrics_kobj;
++static struct msb_metrics_dev *msb_metrics_device;
++static DEFINE_MUTEX(msb_metrics_device_lock);
++
++static void msb_metrics_drain_vq(struct msb_metrics_dev *mdev)
++{
++	unsigned int len;
++
++	while (virtqueue_get_buf(mdev->vq, &len))
++		;
++}
++
++static void msb_metrics_publish(struct msb_metrics_dev *mdev, u64 used, u64 free)
++{
++	struct scatterlist sg;
++	int ret;
++
++	mutex_lock(&mdev->lock);
++
++	msb_metrics_drain_vq(mdev);
++
++	mdev->sample.version = cpu_to_le32(MSB_METRICS_SAMPLE_VERSION);
++	mdev->sample.size = cpu_to_le32(sizeof(mdev->sample));
++	mdev->sample.upper_used_bytes = cpu_to_le64(used);
++	mdev->sample.upper_free_bytes = cpu_to_le64(free);
++
++	sg_init_one(&sg, &mdev->sample, sizeof(mdev->sample));
++	ret = virtqueue_add_outbuf(mdev->vq, &sg, 1, mdev, GFP_KERNEL);
++	if (!ret)
++		virtqueue_kick(mdev->vq);
++
++	mutex_unlock(&mdev->lock);
++}
++
++static void msb_metrics_sample_work(struct work_struct *work)
++{
++	struct msb_metrics_dev *mdev =
++		container_of(to_delayed_work(work), struct msb_metrics_dev, sample_work);
++	struct kstatfs st;
++	struct path upper_path;
++	u64 blocks;
++	u64 used;
++	u64 free;
++	int ret;
++
++	mutex_lock(&mdev->lock);
++	if (!mdev->upper_path_registered) {
++		mutex_unlock(&mdev->lock);
++		return;
++	}
++	upper_path = mdev->upper_path;
++	path_get(&upper_path);
++	mutex_unlock(&mdev->lock);
++
++	ret = vfs_statfs(&upper_path, &st);
++	path_put(&upper_path);
++	if (!ret) {
++		blocks = st.f_blocks - st.f_bfree;
++		used = blocks * st.f_frsize;
++		free = st.f_bavail * st.f_frsize;
++		msb_metrics_publish(mdev, used, free);
++	}
++
++	schedule_delayed_work(&mdev->sample_work, MSB_METRICS_SAMPLE_INTERVAL);
++}
++
++static ssize_t upper_path_store(struct kobject *kobj, struct kobj_attribute *attr,
++				const char *buf, size_t count)
++{
++	struct msb_metrics_dev *mdev;
++	struct path resolved;
++	char *path;
++	int ret;
++
++	path = kstrndup(buf, count, GFP_KERNEL);
++	if (!path)
++		return -ENOMEM;
++	strim(path);
++	if (!path[0]) {
++		kfree(path);
++		return -EINVAL;
++	}
++
++	mutex_lock(&msb_metrics_device_lock);
++	mdev = msb_metrics_device;
++	if (!mdev) {
++		mutex_unlock(&msb_metrics_device_lock);
++		kfree(path);
++		return -ENODEV;
++	}
++
++	mutex_lock(&mdev->lock);
++	if (mdev->upper_path_registered) {
++		mutex_unlock(&mdev->lock);
++		mutex_unlock(&msb_metrics_device_lock);
++		kfree(path);
++		return -EBUSY;
++	}
++	mutex_unlock(&mdev->lock);
++
++	ret = kern_path(path, LOOKUP_FOLLOW, &resolved);
++	kfree(path);
++	if (ret) {
++		mutex_unlock(&msb_metrics_device_lock);
++		return ret;
++	}
++
++	mutex_lock(&mdev->lock);
++	if (mdev->upper_path_registered) {
++		mutex_unlock(&mdev->lock);
++		mutex_unlock(&msb_metrics_device_lock);
++		path_put(&resolved);
++		return -EBUSY;
++	}
++	mdev->upper_path = resolved;
++	mdev->upper_path_registered = true;
++	mutex_unlock(&mdev->lock);
++	mutex_unlock(&msb_metrics_device_lock);
++
++	schedule_delayed_work(&mdev->sample_work, 0);
++
++	return count;
++}
++
++static struct kobj_attribute upper_path_attr = __ATTR_WO(upper_path);
++
++static void msb_metrics_vq_done(struct virtqueue *vq)
++{
++	struct msb_metrics_dev *mdev = vq->vdev->priv;
++
++	mutex_lock(&mdev->lock);
++	msb_metrics_drain_vq(mdev);
++	mutex_unlock(&mdev->lock);
++}
++
++static int msb_metrics_probe(struct virtio_device *vdev)
++{
++	struct msb_metrics_dev *mdev;
++	struct virtqueue *vq;
++	int ret;
++
++	mdev = kzalloc(sizeof(*mdev), GFP_KERNEL);
++	if (!mdev)
++		return -ENOMEM;
++
++	mutex_init(&mdev->lock);
++	INIT_DELAYED_WORK(&mdev->sample_work, msb_metrics_sample_work);
++	mdev->vdev = vdev;
++	vdev->priv = mdev;
++
++	vq = virtio_find_single_vq(vdev, msb_metrics_vq_done, "upper_metrics");
++	if (IS_ERR(vq)) {
++		ret = PTR_ERR(vq);
++		goto err_free;
++	}
++	mdev->vq = vq;
++
++	mutex_lock(&msb_metrics_device_lock);
++	if (msb_metrics_device) {
++		mutex_unlock(&msb_metrics_device_lock);
++		ret = -EBUSY;
++		goto err_del_vqs;
++	}
++	msb_metrics_device = mdev;
++	mutex_unlock(&msb_metrics_device_lock);
++
++	msb_metrics_kobj = kobject_create_and_add("msb_metrics", kernel_kobj);
++	if (!msb_metrics_kobj) {
++		ret = -ENOMEM;
++		goto err_clear_device;
++	}
++
++	ret = sysfs_create_file(msb_metrics_kobj, &upper_path_attr.attr);
++	if (ret)
++		goto err_put_kobj;
++
++	virtio_device_ready(vdev);
++
++	return 0;
++
++err_put_kobj:
++	kobject_put(msb_metrics_kobj);
++	msb_metrics_kobj = NULL;
++err_clear_device:
++	mutex_lock(&msb_metrics_device_lock);
++	msb_metrics_device = NULL;
++	mutex_unlock(&msb_metrics_device_lock);
++err_del_vqs:
++	vdev->config->del_vqs(vdev);
++err_free:
++	kfree(mdev);
++	return ret;
++}
++
++static void msb_metrics_remove(struct virtio_device *vdev)
++{
++	struct msb_metrics_dev *mdev = vdev->priv;
++
++	cancel_delayed_work_sync(&mdev->sample_work);
++
++	if (msb_metrics_kobj) {
++		sysfs_remove_file(msb_metrics_kobj, &upper_path_attr.attr);
++		kobject_put(msb_metrics_kobj);
++		msb_metrics_kobj = NULL;
++	}
++
++	mutex_lock(&msb_metrics_device_lock);
++	msb_metrics_device = NULL;
++	mutex_unlock(&msb_metrics_device_lock);
++
++	mutex_lock(&mdev->lock);
++	if (mdev->upper_path_registered)
++		path_put(&mdev->upper_path);
++	mutex_unlock(&mdev->lock);
++
++	vdev->config->reset(vdev);
++	vdev->config->del_vqs(vdev);
++	kfree(mdev);
++}
++
++static const struct virtio_device_id id_table[] = {
++	{ VIRTIO_ID_MSB_METRICS, VIRTIO_DEV_ANY_ID },
++	{ 0 },
++};
++
++static struct virtio_driver virtio_msb_metrics_driver = {
++	.driver.name = KBUILD_MODNAME,
++	.driver.owner = THIS_MODULE,
++	.id_table = id_table,
++	.probe = msb_metrics_probe,
++	.remove = msb_metrics_remove,
++};
++
++module_virtio_driver(virtio_msb_metrics_driver);
++MODULE_DEVICE_TABLE(virtio, id_table);
++MODULE_DESCRIPTION("Microsandbox protected metrics virtio driver");
++MODULE_LICENSE("GPL");
+diff --git a/include/uapi/linux/virtio_ids.h b/include/uapi/linux/virtio_ids.h
+index 4d2b29958c2a..8d69b4b48df1 100644
+--- a/include/uapi/linux/virtio_ids.h
++++ b/include/uapi/linux/virtio_ids.h
+@@ -68,6 +68,7 @@
+ #define VIRTIO_ID_AUDIO_POLICY		39 /* virtio audio policy */
+ #define VIRTIO_ID_BT			40 /* virtio bluetooth */
+ #define VIRTIO_ID_GPIO			41 /* virtio gpio */
++#define VIRTIO_ID_MSB_METRICS		0x4d53 /* microsandbox metrics */
+ 
+ /*
+  * Virtio Transitional IDs
+-- 
+2.52.0
