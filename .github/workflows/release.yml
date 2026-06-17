@@ -144,3 +144,56 @@ jobs:
           gh release upload "${{ github.event.release.tag_name }}" "libkrunfw-macos-x86_64.${ABI}.dylib"
         env:
           GITHUB_TOKEN: ${{ github.token }}
+
+  # ---------------------------------------------------------------------------
+  # Stage 2: Compile .dll on Windows from kernel.c artifacts
+  # ---------------------------------------------------------------------------
+  build-windows-x86_64:
+    name: Build Windows x86_64
+    runs-on: windows-latest
+    needs: build-linux-x86_64
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+
+      - name: Configure MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Extract version from Makefile
+        id: version
+        shell: bash
+        run: |
+          echo "abi=$(grep '^ABI_VERSION' Makefile | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+          echo "full=$(grep '^FULL_VERSION' Makefile | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: Download kernel.c artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-c-x86_64
+
+      - name: Compile DLL
+        shell: pwsh
+        run: |
+          $abi = "${{ steps.version.outputs.abi }}"
+          cl /nologo /LD /DABI_VERSION=$abi /Fe:libkrunfw-windows-x86_64.dll kernel.c /link /DEF:libkrunfw.def /IMPLIB:libkrunfw-windows-x86_64.lib
+
+      - name: Verify DLL exports
+        shell: pwsh
+        run: |
+          $exports = dumpbin /nologo /exports libkrunfw-windows-x86_64.dll
+          foreach ($symbol in @("krunfw_get_kernel", "krunfw_get_version")) {
+            if ($exports -notmatch $symbol) {
+              throw "Missing export: $symbol"
+            }
+          }
+
+      - name: Upload .dll and import library to release
+        shell: pwsh
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" `
+            "libkrunfw-windows-x86_64.dll" `
+            "libkrunfw-windows-x86_64.lib"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

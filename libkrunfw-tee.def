@@ -1,0 +1,5 @@
+EXPORTS
+    krunfw_get_initrd
+    krunfw_get_kernel
+    krunfw_get_qboot
+    krunfw_get_version

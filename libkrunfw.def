@@ -1,0 +1,3 @@
+EXPORTS
+    krunfw_get_kernel
+    krunfw_get_version

@@ -1,15 +1,20 @@
 import argparse
 import sys
 
-from elftools.elf.elffile import ELFFile
-
 # Use 64k page size for rounding. This should cover 4k/16k/64k kernels
 PAGE_SIZE = 65536
 AARCH64_LOAD_ADDR = '0x80000000'
 
 def write_header(ofile, bundle_name):
     ofile.write('#include <stddef.h>\n')
-    ofile.write('__attribute__ ((aligned ({}))) char {}_BUNDLE[] = \n"'.format(PAGE_SIZE, bundle_name))
+    ofile.write('#if defined(_WIN32)\n')
+    ofile.write('#define KRUNFW_EXPORT __declspec(dllexport)\n')
+    ofile.write('#define KRUNFW_ALIGN(bytes) __declspec(align(bytes))\n')
+    ofile.write('#else\n')
+    ofile.write('#define KRUNFW_EXPORT __attribute__((visibility("default")))\n')
+    ofile.write('#define KRUNFW_ALIGN(bytes) __attribute__((aligned(bytes)))\n')
+    ofile.write('#endif\n')
+    ofile.write('KRUNFW_ALIGN({}) char {}_BUNDLE[] = \n"'.format(PAGE_SIZE, bundle_name))
 
 
 def write_padding(ofile, padding, col):
@@ -26,6 +31,8 @@ def write_padding(ofile, padding, col):
         
         
 def write_elf_cbundle(ifile, ofile) -> int:
+    from elftools.elf.elffile import ELFFile
+
     elffile = ELFFile(ifile)
     entry_addr = elffile['e_entry']
 
@@ -91,7 +98,7 @@ def write_raw_cbundle(ifile, ofile) -> int:
     
 def write_footer_generic(ofile, bundle_name):
     footer = """
-char * krunfw_get_{}(size_t *size)
+KRUNFW_EXPORT char * krunfw_get_{}(size_t *size)
 {{
     *size = sizeof({}_BUNDLE) - 1;
     return &{}_BUNDLE[0];
@@ -103,7 +110,7 @@ char * krunfw_get_{}(size_t *size)
     
 def write_footer_kernel(ofile, load_addr, entry_addr):
     footer = """
-char * krunfw_get_kernel(size_t *load_addr, size_t *entry_addr, size_t *size)
+KRUNFW_EXPORT char * krunfw_get_kernel(size_t *load_addr, size_t *entry_addr, size_t *size)
 {{
     *load_addr = {};
     *entry_addr = {};
@@ -111,7 +118,7 @@ char * krunfw_get_kernel(size_t *load_addr, size_t *entry_addr, size_t *size)
     return &KERNEL_BUNDLE[0];
 }}
 
-int krunfw_get_version()
+KRUNFW_EXPORT int krunfw_get_version()
 {{
     return ABI_VERSION;
 }}

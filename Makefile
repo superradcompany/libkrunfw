@@ -17,14 +17,27 @@ KERNEL_FLAGS += KBUILD_BUILD_VERSION=1
 ifeq ($(SEV),1)
     VARIANT = -sev
     KERNEL_PATCHES += $(shell find patches-tee/ -name "0*.patch" | sort)
+    WINDOWS_DEF_VARIANT = -tee
 endif
 ifeq ($(TDX),1)
     VARIANT = -tdx
     KERNEL_PATCHES += $(shell find patches-tee/ -name "0*.patch" | sort)
+    WINDOWS_DEF_VARIANT = -tee
 endif
 
-HOSTARCH = $(shell uname -m)
-OS = $(shell uname -s)
+HOSTARCH = $(shell uname -m 2>/dev/null || echo x86_64)
+UNAME_S = $(shell uname -s 2>/dev/null || echo Windows_NT)
+ifeq ($(findstring MINGW,$(UNAME_S)),MINGW)
+	OS = Windows
+else ifeq ($(findstring MSYS,$(UNAME_S)),MSYS)
+	OS = Windows
+else ifeq ($(findstring CYGWIN,$(UNAME_S)),CYGWIN)
+	OS = Windows
+else ifeq ($(UNAME_S),Windows_NT)
+	OS = Windows
+else
+	OS = $(UNAME_S)
+endif
 ifeq ($(ARCH),)
 	GUESTARCH := $(HOSTARCH)
 	STRIP := strip
@@ -60,8 +73,28 @@ KRUNFW_SONAME_Darwin = libkrunfw.$(ABI_VERSION).dylib
 KRUNFW_BASE_Darwin = libkrunfw.dylib
 SONAME_Darwin =
 
+KRUNFW_BINARY_Windows = libkrunfw$(VARIANT).dll
+KRUNFW_IMPLIB_Windows = libkrunfw$(VARIANT).lib
+KRUNFW_DEF_Windows = libkrunfw$(WINDOWS_DEF_VARIANT).def
+
 LIBDIR_Linux = lib64
 LIBDIR_Darwin = lib
+LIBDIR_Windows = bin
+
+ifeq ($(OS),Windows)
+WINDOWS_TOOLCHAIN ?= msvc
+ifeq ($(WINDOWS_TOOLCHAIN),msvc)
+ifeq ($(origin CC),default)
+	CC = cl
+endif
+	WINDOWS_SHARED_CMD = $(CC) /nologo /LD /DABI_VERSION=$(ABI_VERSION) /Fe:$@ $(KERNEL_C_BUNDLE) $(QBOOT_C_BUNDLE) $(INITRD_C_BUNDLE) /link /DEF:$(KRUNFW_DEF_Windows) /IMPLIB:$(KRUNFW_IMPLIB_Windows)
+else
+ifeq ($(origin CC),default)
+	CC = gcc
+endif
+	WINDOWS_SHARED_CMD = $(CC) -DABI_VERSION=$(ABI_VERSION) -shared -o $@ $(KERNEL_C_BUNDLE) $(QBOOT_C_BUNDLE) $(INITRD_C_BUNDLE) $(KRUNFW_DEF_Windows)
+endif
+endif
 
 ifeq ($(PREFIX),)
     PREFIX := /usr/local
@@ -97,7 +130,10 @@ $(KERNEL_SOURCES): $(KERNEL_TARBALL)
 $(KERNEL_BINARY_$(GUESTARCH)): $(KERNEL_SOURCES)
 	cd $(KERNEL_SOURCES) ; rm -f .version ; $(MAKE) $(MAKEFLAGS) $(KERNEL_FLAGS)
 
-ifeq ($(OS),Darwin)
+ifeq ($(OS),Windows)
+$(KERNEL_C_BUNDLE):
+	$(error Windows builds consume an existing kernel.c generated on Linux)
+else ifeq ($(OS),Darwin)
 $(KERNEL_C_BUNDLE):
 	@echo "Building on macOS, using ./build_in_docker.sh"
 	./build_in_docker.sh
@@ -127,10 +163,15 @@ $(INITRD_C_BUNDLE): $(INITRD_BINARY)
 	@python3 bin2cbundle.py -t initrd $(INITRD_BINARY) initrd.c
 endif
 
+ifeq ($(OS),Windows)
+$(KRUNFW_BINARY_$(OS)): $(KERNEL_C_BUNDLE) $(QBOOT_C_BUNDLE) $(INITRD_C_BUNDLE) $(KRUNFW_DEF_Windows)
+	$(WINDOWS_SHARED_CMD)
+else
 $(KRUNFW_BINARY_$(OS)): $(KERNEL_C_BUNDLE) $(QBOOT_C_BUNDLE) $(INITRD_C_BUNDLE)
 	$(CC) -fPIC -DABI_VERSION=$(ABI_VERSION) -shared $(SONAME_$(OS)) -o $@ $(KERNEL_C_BUNDLE) $(QBOOT_C_BUNDLE) $(INITRD_C_BUNDLE)
 ifeq ($(OS),Linux)
 	$(STRIP) $(KRUNFW_BINARY_$(OS))
+endif
 endif
 
 install:
@@ -138,9 +179,10 @@ install:
 	install -m 755 $(KRUNFW_BINARY_$(OS)) $(DESTDIR)$(PREFIX)/$(LIBDIR_$(OS))/
 ifeq ($(OS),Darwin)
 	cd $(DESTDIR)$(PREFIX)/$(LIBDIR_$(OS))/ ; ln -sf $(KRUNFW_BINARY_$(OS)) $(KRUNFW_BASE_$(OS))
+else ifeq ($(OS),Windows)
 else
 	cd $(DESTDIR)$(PREFIX)/$(LIBDIR_$(OS))/ ; ln -sf $(KRUNFW_BINARY_$(OS)) $(KRUNFW_SONAME_$(OS)) ; ln -sf $(KRUNFW_SONAME_$(OS)) $(KRUNFW_BASE_$(OS))
 endif
 
 clean:
-	rm -fr $(KERNEL_SOURCES) $(KERNEL_C_BUNDLE) $(QBOOT_C_BUNDLE) $(INITRD_C_BUNDLE) $(KRUNFW_BINARY_$(OS))
+	rm -fr $(KERNEL_SOURCES) $(KERNEL_C_BUNDLE) $(QBOOT_C_BUNDLE) $(INITRD_C_BUNDLE) $(KRUNFW_BINARY_$(OS)) $(KRUNFW_IMPLIB_$(OS))

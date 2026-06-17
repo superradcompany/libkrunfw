@@ -3,6 +3,10 @@ __pycache__
 *~
 libkrunfw.so*
 *.dylib
+*.dll
+*.exp
+*.lib
+*.obj
 kernel.c
 vmlinux
 /tarballs

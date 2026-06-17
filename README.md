@@ -54,6 +54,27 @@ BUILDER=debian ./build_on_krunvm.sh
 
 In general, `./build_on_krunvm.sh` will always delegate to `./build_on_krunvm_${BUILDER}.sh` so additional environments can be added like this if needed.
 
+### Windows
+
+#### Requirements
+* A generated `kernel.c` bundle from a Linux kernel build.
+* Visual Studio Build Tools with the MSVC C/C++ toolchain, or a GNU-style Windows C toolchain.
+
+#### Building the DLL from an existing kernel bundle
+The Linux kernel is still built on Linux. Windows consumes the generated `kernel.c` bundle and links it into a native DLL:
+
+```
+make WINDOWS_TOOLCHAIN=msvc
+```
+
+For GNU-style Windows toolchains, use:
+
+```
+make WINDOWS_TOOLCHAIN=gnu
+```
+
+The generic Windows build exports `krunfw_get_kernel` and `krunfw_get_version`. SEV/TDX builds also export `krunfw_get_qboot` and `krunfw_get_initrd`.
+
 ## Known limitations
 
 * To save memory, the embedded kernel is configured with ```CONFIG_NR_CPUS=8```, which limits the maximum number of supported CPUs to 8. If this kernel runs in a VM with more CPUs, only the first 8 will be initialized and used.
