@@ -18,9 +18,9 @@ Signed-off-by: Microsandbox <development@superrad.company>
 ---
  drivers/virtio/Kconfig             |  10 ++
  drivers/virtio/Makefile            |   1 +
- drivers/virtio/virtio_msb_metrics.c | 278 +++++++++++++++++++++++++++
+ drivers/virtio/virtio_msb_metrics.c | 285 +++++++++++++++++++++++++++
  include/uapi/linux/virtio_ids.h    |   1 +
- 4 files changed, 290 insertions(+)
+ 4 files changed, 297 insertions(+)
  create mode 100644 drivers/virtio/virtio_msb_metrics.c
 
 diff --git a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
@@ -58,7 +58,7 @@ new file mode 100644
 index 000000000000..47ed9b8a7ff3
 --- /dev/null
 +++ b/drivers/virtio/virtio_msb_metrics.c
-@@ -0,0 +1,278 @@
+@@ -0,0 +1,285 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Microsandbox protected metrics virtio driver.
@@ -70,6 +70,7 @@ index 000000000000..47ed9b8a7ff3
 +#include <linux/module.h>
 +#include <linux/mutex.h>
 +#include <linux/namei.h>
++#include <linux/overflow.h>
 +#include <linux/path.h>
 +#include <linux/scatterlist.h>
 +#include <linux/slab.h>
@@ -157,12 +158,18 @@ index 000000000000..47ed9b8a7ff3
 +	ret = vfs_statfs(&upper_path, &st);
 +	path_put(&upper_path);
 +	if (!ret) {
++		if (st.f_bfree > st.f_blocks)
++			goto reschedule;
++
 +		blocks = st.f_blocks - st.f_bfree;
-+		used = blocks * st.f_frsize;
-+		free = st.f_bavail * st.f_frsize;
++		if (check_mul_overflow(blocks, st.f_frsize, &used) ||
++		    check_mul_overflow(st.f_bavail, st.f_frsize, &free))
++			goto reschedule;
++
 +		msb_metrics_publish(mdev, used, free);
 +	}
 +
++reschedule:
 +	schedule_delayed_work(&mdev->sample_work, MSB_METRICS_SAMPLE_INTERVAL);
 +}
 +
