@@ -18,9 +18,9 @@ Signed-off-by: Microsandbox <development@superrad.company>
 ---
  drivers/virtio/Kconfig             |  10 ++
  drivers/virtio/Makefile            |   1 +
- drivers/virtio/virtio_msb_metrics.c | 285 +++++++++++++++++++++++++++
+ drivers/virtio/virtio_msb_metrics.c | 291 +++++++++++++++++++++++++++
  include/uapi/linux/virtio_ids.h    |   1 +
- 4 files changed, 297 insertions(+)
+ 4 files changed, 303 insertions(+)
  create mode 100644 drivers/virtio/virtio_msb_metrics.c
 
 diff --git a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
@@ -58,7 +58,7 @@ new file mode 100644
 index 000000000000..47ed9b8a7ff3
 --- /dev/null
 +++ b/drivers/virtio/virtio_msb_metrics.c
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,291 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Microsandbox protected metrics virtio driver.
@@ -98,6 +98,7 @@ index 000000000000..47ed9b8a7ff3
 +	struct delayed_work sample_work;
 +	struct path upper_path;
 +	bool upper_path_registered;
++	bool sample_in_flight;
 +	struct msb_metrics_upper_sample sample;
 +};
 +
@@ -110,7 +111,7 @@ index 000000000000..47ed9b8a7ff3
 +	unsigned int len;
 +
 +	while (virtqueue_get_buf(mdev->vq, &len))
-+		;
++		mdev->sample_in_flight = false;
 +}
 +
 +static void msb_metrics_publish(struct msb_metrics_dev *mdev, u64 used, u64 free)
@@ -122,6 +123,11 @@ index 000000000000..47ed9b8a7ff3
 +
 +	msb_metrics_drain_vq(mdev);
 +
++	if (mdev->sample_in_flight) {
++		mutex_unlock(&mdev->lock);
++		return;
++	}
++
 +	mdev->sample.version = cpu_to_le32(MSB_METRICS_SAMPLE_VERSION);
 +	mdev->sample.size = cpu_to_le32(sizeof(mdev->sample));
 +	mdev->sample.upper_used_bytes = cpu_to_le64(used);
@@ -129,8 +135,10 @@ index 000000000000..47ed9b8a7ff3
 +
 +	sg_init_one(&sg, &mdev->sample, sizeof(mdev->sample));
 +	ret = virtqueue_add_outbuf(mdev->vq, &sg, 1, mdev, GFP_KERNEL);
-+	if (!ret)
++	if (!ret) {
++		mdev->sample_in_flight = true;
 +		virtqueue_kick(mdev->vq);
++	}
 +
 +	mutex_unlock(&mdev->lock);
 +}
