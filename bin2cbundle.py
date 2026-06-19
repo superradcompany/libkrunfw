@@ -7,14 +7,18 @@ AARCH64_LOAD_ADDR = '0x80000000'
 
 def write_header(ofile, bundle_name):
     ofile.write('#include <stddef.h>\n')
-    ofile.write('#if defined(_WIN32)\n')
+    ofile.write('#if defined(_WIN32) && defined(_MSC_VER)\n')
+    ofile.write('#pragma section(".krunfw", read)\n')
     ofile.write('#define KRUNFW_EXPORT __declspec(dllexport)\n')
-    ofile.write('#define KRUNFW_ALIGN(bytes) __declspec(align(bytes))\n')
+    ofile.write('#define KRUNFW_BUNDLE_STORAGE __declspec(allocate(".krunfw"))\n')
+    ofile.write('#elif defined(_WIN32)\n')
+    ofile.write('#define KRUNFW_EXPORT __declspec(dllexport)\n')
+    ofile.write('#define KRUNFW_BUNDLE_STORAGE __attribute__((section(".krunfw"), aligned({})))\n'.format(PAGE_SIZE))
     ofile.write('#else\n')
     ofile.write('#define KRUNFW_EXPORT __attribute__((visibility("default")))\n')
-    ofile.write('#define KRUNFW_ALIGN(bytes) __attribute__((aligned(bytes)))\n')
+    ofile.write('#define KRUNFW_BUNDLE_STORAGE __attribute__((aligned({})))\n'.format(PAGE_SIZE))
     ofile.write('#endif\n')
-    ofile.write('KRUNFW_ALIGN({}) char {}_BUNDLE[] = \n"'.format(PAGE_SIZE, bundle_name))
+    ofile.write('KRUNFW_BUNDLE_STORAGE char {}_BUNDLE[] = \n"'.format(bundle_name))
 
 
 def write_padding(ofile, padding, col):
