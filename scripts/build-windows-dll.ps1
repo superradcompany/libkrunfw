@@ -4,13 +4,21 @@ param(
     [string] $ImportLibrary = "libkrunfw.lib",
     [string] $Definition = "libkrunfw.def",
     [string[]] $Sources = @("kernel.c"),
-    [int] $SectionAlignment = 65536
+    [int] $SectionAlignment = 65536,
+    [string] $Architecture = "",
+    [string] $HostArchitecture = ""
 )
 
 $ErrorActionPreference = "Stop"
 
 . "$PSScriptRoot\msvc-env.ps1"
-Set-MsvcEnvironment
+if (-not $Architecture) {
+    $Architecture = Get-NativeMsvcArchitecture
+}
+if (-not $HostArchitecture) {
+    $HostArchitecture = Get-NativeMsvcArchitecture
+}
+Set-MsvcEnvironment -Architecture $Architecture -HostArchitecture $HostArchitecture
 
 if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
     throw "cl.exe was not found. Run this from an MSVC developer shell or configure the Visual Studio Build Tools environment first."

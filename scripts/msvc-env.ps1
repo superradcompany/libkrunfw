@@ -1,11 +1,22 @@
+function Get-NativeMsvcArchitecture {
+    switch ($env:PROCESSOR_ARCHITECTURE) {
+        "ARM64" { return "arm64" }
+        "AMD64" { return "x64" }
+        "x86" { return "x86" }
+        default { return "x64" }
+    }
+}
+
 function Set-MsvcEnvironment {
     param(
-        [string] $Architecture = "x64",
-        [string] $HostArchitecture = "x64"
+        [string] $Architecture = (Get-NativeMsvcArchitecture),
+        [string] $HostArchitecture = (Get-NativeMsvcArchitecture)
     )
 
     if (Get-Command cl.exe -ErrorAction SilentlyContinue) {
-        return
+        if (-not $env:VSCMD_ARG_TGT_ARCH -or $env:VSCMD_ARG_TGT_ARCH -eq $Architecture) {
+            return
+        }
     }
 
     $vswhereCandidates = @(
