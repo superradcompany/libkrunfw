@@ -58,7 +58,7 @@ new file mode 100644
 index 000000000000..47ed9b8a7ff3
 --- /dev/null
 +++ b/drivers/virtio/virtio_msb_metrics.c
-@@ -0,0 +1,291 @@
+@@ -0,0 +1,302 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Microsandbox protected metrics virtio driver.
@@ -74,6 +74,7 @@ index 000000000000..47ed9b8a7ff3
 +#include <linux/path.h>
 +#include <linux/scatterlist.h>
 +#include <linux/slab.h>
++#include <linux/spinlock.h>
 +#include <linux/statfs.h>
 +#include <linux/string.h>
 +#include <linux/sysfs.h>
@@ -94,7 +95,8 @@ index 000000000000..47ed9b8a7ff3
 +struct msb_metrics_dev {
 +	struct virtio_device *vdev;
 +	struct virtqueue *vq;
-+	struct mutex lock; /* Protects upper_path and sample queueing. */
++	struct mutex path_lock; /* Protects upper_path registration. */
++	spinlock_t vq_lock; /* Protects sample_in_flight and virtqueue updates. */
 +	struct delayed_work sample_work;
 +	struct path upper_path;
 +	bool upper_path_registered;
@@ -117,14 +119,16 @@ index 000000000000..47ed9b8a7ff3
 +static void msb_metrics_publish(struct msb_metrics_dev *mdev, u64 used, u64 free)
 +{
 +	struct scatterlist sg;
++	unsigned long flags;
++	bool kick = false;
 +	int ret;
 +
-+	mutex_lock(&mdev->lock);
++	spin_lock_irqsave(&mdev->vq_lock, flags);
 +
 +	msb_metrics_drain_vq(mdev);
 +
 +	if (mdev->sample_in_flight) {
-+		mutex_unlock(&mdev->lock);
++		spin_unlock_irqrestore(&mdev->vq_lock, flags);
 +		return;
 +	}
 +
@@ -134,13 +138,16 @@ index 000000000000..47ed9b8a7ff3
 +	mdev->sample.upper_free_bytes = cpu_to_le64(free);
 +
 +	sg_init_one(&sg, &mdev->sample, sizeof(mdev->sample));
-+	ret = virtqueue_add_outbuf(mdev->vq, &sg, 1, mdev, GFP_KERNEL);
++	ret = virtqueue_add_outbuf(mdev->vq, &sg, 1, mdev, GFP_ATOMIC);
 +	if (!ret) {
 +		mdev->sample_in_flight = true;
-+		virtqueue_kick(mdev->vq);
++		kick = true;
 +	}
 +
-+	mutex_unlock(&mdev->lock);
++	spin_unlock_irqrestore(&mdev->vq_lock, flags);
++
++	if (kick)
++		virtqueue_kick(mdev->vq);
 +}
 +
 +static void msb_metrics_sample_work(struct work_struct *work)
@@ -154,14 +161,14 @@ index 000000000000..47ed9b8a7ff3
 +	u64 free;
 +	int ret;
 +
-+	mutex_lock(&mdev->lock);
++	mutex_lock(&mdev->path_lock);
 +	if (!mdev->upper_path_registered) {
-+		mutex_unlock(&mdev->lock);
++		mutex_unlock(&mdev->path_lock);
 +		return;
 +	}
 +	upper_path = mdev->upper_path;
 +	path_get(&upper_path);
-+	mutex_unlock(&mdev->lock);
++	mutex_unlock(&mdev->path_lock);
 +
 +	ret = vfs_statfs(&upper_path, &st);
 +	path_put(&upper_path);
@@ -206,14 +213,14 @@ index 000000000000..47ed9b8a7ff3
 +		return -ENODEV;
 +	}
 +
-+	mutex_lock(&mdev->lock);
++	mutex_lock(&mdev->path_lock);
 +	if (mdev->upper_path_registered) {
-+		mutex_unlock(&mdev->lock);
++		mutex_unlock(&mdev->path_lock);
 +		mutex_unlock(&msb_metrics_device_lock);
 +		kfree(path);
 +		return -EBUSY;
 +	}
-+	mutex_unlock(&mdev->lock);
++	mutex_unlock(&mdev->path_lock);
 +
 +	ret = kern_path(path, LOOKUP_FOLLOW, &resolved);
 +	kfree(path);
@@ -222,16 +229,16 @@ index 000000000000..47ed9b8a7ff3
 +		return ret;
 +	}
 +
-+	mutex_lock(&mdev->lock);
++	mutex_lock(&mdev->path_lock);
 +	if (mdev->upper_path_registered) {
-+		mutex_unlock(&mdev->lock);
++		mutex_unlock(&mdev->path_lock);
 +		mutex_unlock(&msb_metrics_device_lock);
 +		path_put(&resolved);
 +		return -EBUSY;
 +	}
 +	mdev->upper_path = resolved;
 +	mdev->upper_path_registered = true;
-+	mutex_unlock(&mdev->lock);
++	mutex_unlock(&mdev->path_lock);
 +	mutex_unlock(&msb_metrics_device_lock);
 +
 +	schedule_delayed_work(&mdev->sample_work, 0);
@@ -244,10 +251,11 @@ index 000000000000..47ed9b8a7ff3
 +static void msb_metrics_vq_done(struct virtqueue *vq)
 +{
 +	struct msb_metrics_dev *mdev = vq->vdev->priv;
++	unsigned long flags;
 +
-+	mutex_lock(&mdev->lock);
++	spin_lock_irqsave(&mdev->vq_lock, flags);
 +	msb_metrics_drain_vq(mdev);
-+	mutex_unlock(&mdev->lock);
++	spin_unlock_irqrestore(&mdev->vq_lock, flags);
 +}
 +
 +static int msb_metrics_probe(struct virtio_device *vdev)
@@ -260,7 +268,8 @@ index 000000000000..47ed9b8a7ff3
 +	if (!mdev)
 +		return -ENOMEM;
 +
-+	mutex_init(&mdev->lock);
++	mutex_init(&mdev->path_lock);
++	spin_lock_init(&mdev->vq_lock);
 +	INIT_DELAYED_WORK(&mdev->sample_work, msb_metrics_sample_work);
 +	mdev->vdev = vdev;
 +	vdev->priv = mdev;
@@ -325,10 +334,10 @@ index 000000000000..47ed9b8a7ff3
 +	msb_metrics_device = NULL;
 +	mutex_unlock(&msb_metrics_device_lock);
 +
-+	mutex_lock(&mdev->lock);
++	mutex_lock(&mdev->path_lock);
 +	if (mdev->upper_path_registered)
 +		path_put(&mdev->upper_path);
-+	mutex_unlock(&mdev->lock);
++	mutex_unlock(&mdev->path_lock);
 +
 +	vdev->config->reset(vdev);
 +	vdev->config->del_vqs(vdev);
