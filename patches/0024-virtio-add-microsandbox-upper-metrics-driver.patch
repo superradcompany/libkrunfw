@@ -18,9 +18,9 @@ Signed-off-by: Microsandbox <development@superrad.company>
 ---
  drivers/virtio/Kconfig             |  10 ++
  drivers/virtio/Makefile            |   1 +
- drivers/virtio/virtio_msb_metrics.c | 291 +++++++++++++++++++++++++++
+ drivers/virtio/virtio_msb_metrics.c | 307 +++++++++++++++++++++++++++
  include/uapi/linux/virtio_ids.h    |   1 +
- 4 files changed, 303 insertions(+)
+ 4 files changed, 319 insertions(+)
  create mode 100644 drivers/virtio/virtio_msb_metrics.c
 
 diff --git a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
@@ -58,7 +58,7 @@ new file mode 100644
 index 000000000000..47ed9b8a7ff3
 --- /dev/null
 +++ b/drivers/virtio/virtio_msb_metrics.c
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,307 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Microsandbox protected metrics virtio driver.
@@ -241,7 +241,12 @@ index 000000000000..47ed9b8a7ff3
 +	mutex_unlock(&mdev->path_lock);
 +	mutex_unlock(&msb_metrics_device_lock);
 +
-+	schedule_delayed_work(&mdev->sample_work, 0);
++	/*
++	 * Agentd writes the upper path before it reports init context to the
++	 * host, so keep registration lightweight and publish the first sample
++	 * after the boot-critical path has had a chance to settle.
++	 */
++	schedule_delayed_work(&mdev->sample_work, MSB_METRICS_SAMPLE_INTERVAL);
 +
 +	return count;
 +}
