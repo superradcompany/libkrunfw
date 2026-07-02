@@ -1,6 +1,7 @@
 KERNEL_VERSION = linux-6.12.68
-KERNEL_REMOTE = https://cdn.kernel.org/pub/linux/kernel/v6.x/$(KERNEL_VERSION).tar.xz
-KERNEL_TARBALL = tarballs/$(KERNEL_VERSION).tar.xz
+# Fetch stable snapshots directly so HTTP errors are visible instead of cached as tarballs.
+KERNEL_REMOTE = https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/snapshot/$(KERNEL_VERSION).tar.gz
+KERNEL_TARBALL = tarballs/$(KERNEL_VERSION).tar.gz
 KERNEL_SOURCES = $(KERNEL_VERSION)
 KERNEL_PATCHES = $(shell find patches/ -name "0*.patch" | sort)
 KERNEL_C_BUNDLE = kernel.c
@@ -120,7 +121,7 @@ all: $(KRUNFW_BINARY_$(OS))
 
 $(KERNEL_TARBALL):
 	@mkdir -p tarballs
-	curl $(KERNEL_REMOTE) -o $(KERNEL_TARBALL)
+	curl --fail --location --retry 5 --retry-delay 2 $(KERNEL_REMOTE) -o $(KERNEL_TARBALL)
 
 $(KERNEL_SOURCES): $(KERNEL_TARBALL)
 	tar xf $(KERNEL_TARBALL)
