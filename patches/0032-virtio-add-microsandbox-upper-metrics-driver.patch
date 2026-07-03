@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From b07dbd2b9c23bdc6a198aed5f2f71650192b3dc6 Mon Sep 17 00:00:00 2001
 From: Microsandbox <development@superrad.company>
-Date: Tue, 16 Jun 2026 00:00:00 +0000
-Subject: [PATCH 24/24] virtio: add microsandbox upper metrics driver
+Date: Fri, 3 Jul 2026 02:37:05 +0100
+Subject: [PATCH 32/32] virtio: add microsandbox upper metrics driver
 
 Add a small built-in virtio driver for microsandbox's private metrics
 device. The driver lets PID 1 register the mounted OCI upper filesystem
@@ -16,18 +16,18 @@ registered filesystem's usage.
 
 Signed-off-by: Microsandbox <development@superrad.company>
 ---
- drivers/virtio/Kconfig             |  10 ++
- drivers/virtio/Makefile            |   1 +
- drivers/virtio/virtio_msb_metrics.c | 307 +++++++++++++++++++++++++++
- include/uapi/linux/virtio_ids.h    |   1 +
+ drivers/virtio/Kconfig              |  10 +
+ drivers/virtio/Makefile             |   1 +
+ drivers/virtio/virtio_msb_metrics.c | 307 ++++++++++++++++++++++++++++
+ include/uapi/linux/virtio_ids.h     |   1 +
  4 files changed, 319 insertions(+)
  create mode 100644 drivers/virtio/virtio_msb_metrics.c
 
 diff --git a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
-index 86c00dc48f34..22c4d7db30ba 100644
+index 8279d6d5a..3517478d7 100644
 --- a/drivers/virtio/Kconfig
 +++ b/drivers/virtio/Kconfig
-@@ -31,6 +31,16 @@ menuconfig VIRTIO_MENU
+@@ -33,6 +33,16 @@ menuconfig VIRTIO_MENU
  
  if VIRTIO_MENU
  
@@ -45,17 +45,20 @@ index 86c00dc48f34..22c4d7db30ba 100644
          bool "Harden virtio notification"
          depends on BROKEN
 diff --git a/drivers/virtio/Makefile b/drivers/virtio/Makefile
-index 17721f60e6d5..592a4be5390c 100644
+index eefcfe90d..9b2538989 100644
 --- a/drivers/virtio/Makefile
 +++ b/drivers/virtio/Makefile
-@@ -14,3 +14,4 @@ obj-$(CONFIG_VIRTIO_VDPA) += virtio_vdpa.o
- obj-$(CONFIG_VIRTIO_MEM) += virtio_mem.o
+@@ -15,6 +15,7 @@ obj-$(CONFIG_VIRTIO_MEM) += virtio_mem.o
  obj-$(CONFIG_VIRTIO_DMA_SHARED_BUFFER) += virtio_dma_buf.o
  obj-$(CONFIG_VIRTIO_DEBUG) += virtio_debug.o
+ obj-$(CONFIG_VIRTIO_RTC) += virtio_rtc.o
 +obj-$(CONFIG_VIRTIO_MSB_METRICS) += virtio_msb_metrics.o
+ virtio_rtc-y := virtio_rtc_driver.o
+ virtio_rtc-$(CONFIG_VIRTIO_RTC_PTP) += virtio_rtc_ptp.o
+ virtio_rtc-$(CONFIG_VIRTIO_RTC_ARM) += virtio_rtc_arm.o
 diff --git a/drivers/virtio/virtio_msb_metrics.c b/drivers/virtio/virtio_msb_metrics.c
 new file mode 100644
-index 000000000000..47ed9b8a7ff3
+index 000000000..7401ca90b
 --- /dev/null
 +++ b/drivers/virtio/virtio_msb_metrics.c
 @@ -0,0 +1,307 @@
@@ -367,7 +370,7 @@ index 000000000000..47ed9b8a7ff3
 +MODULE_DESCRIPTION("Microsandbox protected metrics virtio driver");
 +MODULE_LICENSE("GPL");
 diff --git a/include/uapi/linux/virtio_ids.h b/include/uapi/linux/virtio_ids.h
-index 4d2b29958c2a..8d69b4b48df1 100644
+index 7aa2eb766..b8aa8da6b 100644
 --- a/include/uapi/linux/virtio_ids.h
 +++ b/include/uapi/linux/virtio_ids.h
 @@ -68,6 +68,7 @@
@@ -379,4 +382,4 @@ index 4d2b29958c2a..8d69b4b48df1 100644
  /*
   * Virtio Transitional IDs
 -- 
-2.52.0
+2.39.0

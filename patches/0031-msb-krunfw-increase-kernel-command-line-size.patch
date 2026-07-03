@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Microsandbox <development@superrad.company>
 Date: Sat, 30 May 2026 00:00:00 +0000
-Subject: [PATCH 23/23] msb-krunfw: increase kernel command line size
+Subject: [PATCH 31/32] msb-krunfw: increase kernel command line size
 
 Microsandbox currently passes early boot configuration through the kernel
 command line while agentd is brought up as PID 1. The stock arch limits are

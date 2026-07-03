@@ -11,7 +11,13 @@ By having the kernel bundled in a dynamic library, ```libkrun``` can leave to th
 #### Requirements
 * The toolchain your distribution needs to build a Linux kernel.
 * Python 3
-* ```pyelftools``` (package ```python3-pyelftools``` in Fedora and Ubuntu)
+* ```pyelftools``` (package ```python3-pyelftools``` in Fedora)
+
+On Debian/Ubuntu:
+
+```sh
+apt install python3-pyelftools build-essential flex bison libelf-dev
+```
 
 #### Building and installing the library
 ```
@@ -86,9 +92,43 @@ The scripts discover Visual Studio Build Tools with `vswhere` and initialize the
 
 The generic Windows build exports `krunfw_get_kernel` and `krunfw_get_version`. SEV and TDX builds use `libkrunfw-tee.def`, bundle the matching qboot firmware and initrd, and also export `krunfw_get_qboot` and `krunfw_get_initrd`.
 
+### Windows cross-compilation from Linux
+
+#### Requirements
+* A Linux host with the toolchain needed to build a Linux kernel.
+* The MinGW-w64 cross-compiler (`x86_64-w64-mingw32-gcc`), available as `mingw-w64-gcc` (Fedora) or `gcc-mingw-w64-x86-64` (Debian/Ubuntu).
+* Python 3
+* ```pyelftools``` (package ```python3-pyelftools``` in Fedora and Ubuntu)
+
+#### How it works
+
+The Windows build uses a dedicated kernel configuration (`config-libkrunfw-windows_x86_64`) that enables Hyper-V guest enlightenments (`CONFIG_HYPERV`, `CONFIG_HYPERV_TIMER`, `CONFIG_HYPERV_UTILS`), allowing the guest kernel to take advantage of the Windows Hypervisor Platform (WHP).
+
+The resulting `libkrunfw.dll` is produced using the MinGW-w64 toolchain and can be consumed by the Windows build of [libkrun](https://github.com/containers/libkrun).
+
+#### Building the library
+```
+make OS=Windows WINDOWS_TOOLCHAIN=mingw
+```
+
+This will:
+1. Download and patch the kernel sources.
+2. Build the kernel using the Windows-specific configuration.
+3. Generate the C bundle.
+4. Cross-compile `libkrunfw.dll` using `x86_64-w64-mingw32-gcc`.
+
 ## Known limitations
 
-* To save memory, the embedded kernel is configured with ```CONFIG_NR_CPUS=8```, which limits the maximum number of supported CPUs to 8. If this kernel runs in a VM with more CPUs, only the first 8 will be initialized and used.
+* To save memory, the embedded kernel is configured with a limited number of CPUS. The CPU limit depends on the config target. If this kernel runs in a VM with more CPUs than it is configured for, only the first N CPUs will be initialized and used.
+
+| Target         | `NR_CPUS=` |
+|----------------|------------|
+| x86_64         | 16         |
+| sev_x86_64     | 8          |
+| tdx_x86_64     | 8          |
+| windows_x86_64 | 16         |
+| aarch64        | 16         |
+| riscv64        | 16         |
 
 ## License
 
