@@ -1,0 +1,197 @@
+From: Microsandbox <development@superrad.company>
+Date: Fri, 4 Jul 2026 05:00:00 +0100
+Subject: [PATCH 33/33] virtio: add microsandbox cpu capacity driver
+
+Add a small built-in virtio driver that converges the guest's online
+CPU count on a target the host publishes through a private virtio
+device, enabling live CPU resize for microsandbox sandboxes. CPUs are
+onlined lowest-first and offlined highest-first; CPU 0 is never
+offlined by the driver. The host VMM remains authoritative: vCPUs above
+the enforced count are parked host-side whether or not the driver
+cooperates.
+
+Signed-off-by: Microsandbox <development@superrad.company>
+---
+--- a/drivers/virtio/Kconfig
++++ b/drivers/virtio/Kconfig
+@@ -42,6 +42,16 @@
+ 	  to a private host virtio device. It is intended for bundled
+ 	  microsandbox kernels; custom kernels may omit it and will simply leave
+ 	  the corresponding host metrics unavailable.
++
++config VIRTIO_MSB_CPU
++	bool "Microsandbox CPU capacity virtio driver"
++	depends on VIRTIO && HOTPLUG_CPU
++	default y
++	help
++	  This driver converges the guest's online CPU count on a target the
++	  host publishes through a private virtio device, enabling live CPU
++	  resize for microsandbox sandboxes. Custom kernels may omit it; the
++	  host then reports CPU resizes as not converging.
+ 
+ config VIRTIO_HARDEN_NOTIFICATION
+         bool "Harden virtio notification"
+--- a/drivers/virtio/Makefile
++++ b/drivers/virtio/Makefile
+@@ -16,6 +16,7 @@
+ obj-$(CONFIG_VIRTIO_DEBUG) += virtio_debug.o
+ obj-$(CONFIG_VIRTIO_RTC) += virtio_rtc.o
+ obj-$(CONFIG_VIRTIO_MSB_METRICS) += virtio_msb_metrics.o
++obj-$(CONFIG_VIRTIO_MSB_CPU) += virtio_msb_cpu.o
+ virtio_rtc-y := virtio_rtc_driver.o
+ virtio_rtc-$(CONFIG_VIRTIO_RTC_PTP) += virtio_rtc_ptp.o
+ virtio_rtc-$(CONFIG_VIRTIO_RTC_ARM) += virtio_rtc_arm.o
+--- /dev/null
++++ b/drivers/virtio/virtio_msb_cpu.c
+@@ -0,0 +1,141 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Microsandbox CPU capacity virtio driver.
++ *
++ * The host publishes a desired online CPU count through device config space;
++ * this driver onlines or offlines CPUs to converge on it and reports the
++ * achieved count back through a guest-writable config field. CPUs are onlined
++ * lowest-first and offlined highest-first; CPU 0 is never offlined. The host
++ * side stays authoritative regardless: vCPUs above the enforced count are
++ * parked by the VMM whether or not this driver cooperates.
++ */
++
++#include <linux/cpu.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/virtio.h>
++#include <linux/virtio_config.h>
++#include <linux/virtio_ids.h>
++#include <linux/workqueue.h>
++
++struct virtio_msb_cpu_config {
++	__le32 possible;
++	__le32 requested_online;
++	__le32 actual_online;
++} __packed;
++
++struct msb_cpu_dev {
++	struct virtio_device *vdev;
++	/* Unused for data transfer, but allocating it makes the transport
++	 * request its interrupt line, which config-change notification rides on.
++	 */
++	struct virtqueue *vq;
++	struct work_struct converge_work;
++};
++
++static void msb_cpu_set_online(unsigned int cpu, bool online)
++{
++	struct device *dev = get_cpu_device(cpu);
++	int ret;
++
++	if (!dev || cpu_online(cpu) == online)
++		return;
++
++	ret = online ? device_online(dev) : device_offline(dev);
++	if (ret < 0)
++		pr_warn("virtio_msb_cpu: failed to %s CPU%u: %d\n",
++			online ? "online" : "offline", cpu, ret);
++}
++
++static void msb_cpu_converge(struct work_struct *work)
++{
++	struct msb_cpu_dev *cdev =
++		container_of(work, struct msb_cpu_dev, converge_work);
++	u32 possible, requested, online;
++	unsigned int cpu;
++
++	virtio_cread_le(cdev->vdev, struct virtio_msb_cpu_config, possible,
++			&possible);
++	virtio_cread_le(cdev->vdev, struct virtio_msb_cpu_config,
++			requested_online, &requested);
++
++	requested = clamp_t(u32, requested, 1, possible);
++
++	lock_device_hotplug();
++	/* Online low CPUs first so the online set stays contiguous. */
++	for (cpu = 1; cpu < requested && cpu < possible; cpu++)
++		msb_cpu_set_online(cpu, true);
++	/* Offline from the top; CPU 0 is exempt by loop construction. */
++	for (cpu = possible - 1; cpu >= requested && cpu >= 1; cpu--)
++		msb_cpu_set_online(cpu, false);
++	unlock_device_hotplug();
++
++	online = num_online_cpus();
++	virtio_cwrite_le(cdev->vdev, struct virtio_msb_cpu_config,
++			 actual_online, &online);
++}
++
++static void msb_cpu_config_changed(struct virtio_device *vdev)
++{
++	struct msb_cpu_dev *cdev = vdev->priv;
++
++	schedule_work(&cdev->converge_work);
++}
++
++static int msb_cpu_probe(struct virtio_device *vdev)
++{
++	struct msb_cpu_dev *cdev;
++
++	cdev = kzalloc(sizeof(*cdev), GFP_KERNEL);
++	if (!cdev)
++		return -ENOMEM;
++
++	cdev->vdev = vdev;
++	INIT_WORK(&cdev->converge_work, msb_cpu_converge);
++	vdev->priv = cdev;
++
++	cdev->vq = virtio_find_single_vq(vdev, NULL, "unused");
++	if (IS_ERR(cdev->vq)) {
++		int err = PTR_ERR(cdev->vq);
++
++		kfree(cdev);
++		return err;
++	}
++
++	virtio_device_ready(vdev);
++
++	/* Converge once at probe in case the host set a target before boot
++	 * finished; this also publishes the initial actual_online count.
++	 */
++	schedule_work(&cdev->converge_work);
++	return 0;
++}
++
++static void msb_cpu_remove(struct virtio_device *vdev)
++{
++	struct msb_cpu_dev *cdev = vdev->priv;
++
++	virtio_reset_device(vdev);
++	cancel_work_sync(&cdev->converge_work);
++	vdev->config->del_vqs(vdev);
++	kfree(cdev);
++}
++
++static const struct virtio_device_id id_table[] = {
++	{ VIRTIO_ID_MSB_CPU, VIRTIO_DEV_ANY_ID },
++	{ 0 },
++};
++
++static struct virtio_driver virtio_msb_cpu_driver = {
++	.driver.name = KBUILD_MODNAME,
++	.driver.owner = THIS_MODULE,
++	.id_table = id_table,
++	.probe = msb_cpu_probe,
++	.remove = msb_cpu_remove,
++	.config_changed = msb_cpu_config_changed,
++};
++
++module_virtio_driver(virtio_msb_cpu_driver);
++MODULE_DEVICE_TABLE(virtio, id_table);
++MODULE_DESCRIPTION("Microsandbox CPU capacity virtio driver");
++MODULE_LICENSE("GPL");
+--- a/include/uapi/linux/virtio_ids.h
++++ b/include/uapi/linux/virtio_ids.h
+@@ -69,6 +69,7 @@
+ #define VIRTIO_ID_BT			40 /* virtio bluetooth */
+ #define VIRTIO_ID_GPIO			41 /* virtio gpio */
+ #define VIRTIO_ID_MSB_METRICS		0x4d53 /* microsandbox metrics */
++#define VIRTIO_ID_MSB_CPU		0x4d43 /* microsandbox cpu capacity */
+ 
+ /*
+  * Virtio Transitional IDs
