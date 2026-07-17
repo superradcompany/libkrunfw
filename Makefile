@@ -1,4 +1,4 @@
-KERNEL_VERSION = linux-6.12.91
+KERNEL_VERSION = linux-6.12.95
 # Fetch stable snapshots directly so HTTP errors are visible instead of cached as tarballs.
 KERNEL_REMOTE = https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/snapshot/$(KERNEL_VERSION).tar.gz
 KERNEL_TARBALL = tarballs/$(KERNEL_VERSION).tar.gz
@@ -7,8 +7,8 @@ KERNEL_PATCHES = $(shell find patches/ -name "0*.patch" | sort)
 KERNEL_C_BUNDLE = kernel.c
 
 ABI_VERSION = 5
-FULL_VERSION = 5.5.0
-TIMESTAMP = "Mon Jun  1 16:28:39 CEST 2026"
+FULL_VERSION = 5.6.0
+TIMESTAMP = "Sat Jul 18 00:02:54 WAT 2026"
 
 KERNEL_FLAGS = KBUILD_BUILD_TIMESTAMP=$(TIMESTAMP)
 KERNEL_FLAGS += KBUILD_BUILD_USER=root
