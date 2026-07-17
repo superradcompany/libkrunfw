@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Code checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y make gcc bc bison flex elfutils python3-pyelftools curl patch libelf-dev cpio xz-utils
@@ -30,7 +30,7 @@ jobs:
         run: make -j"$(nproc)"
 
       - name: Upload kernel.c as job artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: kernel-c-x86_64
           path: kernel.c
@@ -50,7 +50,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - name: Code checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y make gcc bc bison flex elfutils python3-pyelftools curl patch libelf-dev cpio xz-utils
@@ -65,7 +65,7 @@ jobs:
         run: make -j"$(nproc)"
 
       - name: Upload kernel.c as job artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: kernel-c-aarch64
           path: kernel.c
@@ -89,7 +89,7 @@ jobs:
     needs: build-linux-aarch64
     steps:
       - name: Code checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Extract version from Makefile
         id: version
@@ -98,7 +98,7 @@ jobs:
           echo "full=$(grep '^FULL_VERSION' Makefile | awk '{print $3}')" >> "$GITHUB_OUTPUT"
 
       - name: Download kernel.c artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: kernel-c-aarch64
 
@@ -120,7 +120,7 @@ jobs:
     needs: build-linux-x86_64
     steps:
       - name: Code checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Extract version from Makefile
         id: version
@@ -129,7 +129,7 @@ jobs:
           echo "full=$(grep '^FULL_VERSION' Makefile | awk '{print $3}')" >> "$GITHUB_OUTPUT"
 
       - name: Download kernel.c artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: kernel-c-x86_64
 
@@ -154,7 +154,7 @@ jobs:
     needs: build-linux-x86_64
     steps:
       - name: Code checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Configure MSVC
         uses: ilammy/msvc-dev-cmd@v1
@@ -169,7 +169,7 @@ jobs:
           echo "full=$(grep '^FULL_VERSION' Makefile | awk '{print $3}')" >> "$GITHUB_OUTPUT"
 
       - name: Download kernel.c artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: kernel-c-x86_64
 

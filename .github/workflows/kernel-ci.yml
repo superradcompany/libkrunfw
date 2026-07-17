@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Code checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Check pinned kernel
         run: scripts/check-kernel-version.sh
@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Code checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download kernel source
         run: |
@@ -40,7 +40,7 @@ jobs:
         run: tar tzf tarballs/*.tar.gz >/dev/null
 
       - name: Upload kernel source
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: kernel-source
           path: tarballs/*.tar.gz
@@ -81,10 +81,10 @@ jobs:
             make_args: ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu-
     steps:
       - name: Code checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download kernel source
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: kernel-source
           path: tarballs
