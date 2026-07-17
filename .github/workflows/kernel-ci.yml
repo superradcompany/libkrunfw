@@ -1,0 +1,102 @@
+name: Kernel CI
+
+on:
+  pull_request:
+    branches: [krunfw]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  freshness:
+    name: Check stable kernel version
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+
+      - name: Check pinned kernel
+        run: scripts/check-kernel-version.sh
+
+  source:
+    name: Fetch kernel source
+    needs: freshness
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+
+      - name: Download kernel source
+        run: |
+          kernel_version=$(awk '$1 == "KERNEL_VERSION" { print $3; exit }' Makefile)
+          make "tarballs/${kernel_version}.tar.gz"
+
+      - name: Verify kernel source archive
+        run: tar tzf tarballs/*.tar.gz >/dev/null
+
+      - name: Upload kernel source
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-source
+          path: tarballs/*.tar.gz
+          compression-level: 0
+          retention-days: 1
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: source
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-24.04
+            packages: ""
+            make_args: ""
+          - name: Windows x86_64
+            runner: ubuntu-24.04
+            packages: ""
+            make_args: OS=Windows
+          - name: SEV x86_64
+            runner: ubuntu-24.04
+            packages: ""
+            make_args: SEV=1
+          - name: TDX x86_64
+            runner: ubuntu-24.04
+            packages: ""
+            make_args: TDX=1
+          - name: Linux aarch64
+            runner: ubuntu-24.04-arm
+            packages: ""
+            make_args: ""
+          - name: Linux riscv64
+            runner: ubuntu-24.04
+            packages: gcc-riscv64-linux-gnu
+            make_args: ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu-
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+
+      - name: Download kernel source
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-source
+          path: tarballs
+
+      - name: Install build dependencies
+        env:
+          EXTRA_PACKAGES: ${{ matrix.packages }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make gcc bc bison flex elfutils python3-pyelftools curl patch libelf-dev cpio xz-utils $EXTRA_PACKAGES
+
+      - name: Build kernel configuration
+        env:
+          MAKE_ARGS: ${{ matrix.make_args }}
+        run: make -j"$(nproc)" $MAKE_ARGS kernel.c

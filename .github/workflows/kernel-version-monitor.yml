@@ -1,0 +1,71 @@
+name: Kernel version monitor
+
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    name: Check stable kernel version
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v4
+
+      - name: Check pinned kernel
+        id: kernel
+        shell: bash
+        run: |
+          set +e
+          output=$(scripts/check-kernel-version.sh)
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          while IFS='=' read -r key value; do
+            if [[ $key == "current" || $key == "latest" ]]; then
+              echo "$key=$value" >> "$GITHUB_OUTPUT"
+            fi
+          done <<< "$output"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Open kernel update issue
+        if: steps.kernel.outputs.status == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_VERSION: ${{ steps.kernel.outputs.current }}
+          LATEST_VERSION: ${{ steps.kernel.outputs.latest }}
+        run: |
+          issue_title="Kernel stable update available"
+          issue_number=$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" --jq ".[] | select((has(\"pull_request\") | not) and .title == \"$issue_title\") | .number" | head -n 1)
+          if [[ -n $issue_number ]]; then
+            echo "Issue #$issue_number already tracks the available update"
+            exit 0
+          fi
+          printf -v issue_body 'libkrunfw pins Linux %s, but Linux %s is now available in the same stable series. Update `KERNEL_VERSION`, apply every common and TEE patch, and let Kernel CI build all six configurations before merging.\n\nDetected by [this scheduled run](%s/%s/actions/runs/%s).' "$CURRENT_VERSION" "$LATEST_VERSION" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+          gh issue create \
+            --title "$issue_title" \
+            --body "$issue_body"
+
+      - name: Close resolved kernel update issue
+        if: steps.kernel.outputs.status == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          issue_title="Kernel stable update available"
+          issue_number=$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" --jq ".[] | select((has(\"pull_request\") | not) and .title == \"$issue_title\") | .number" | head -n 1)
+          if [[ -n $issue_number ]]; then
+            gh issue close "$issue_number" --comment "The pinned kernel now matches the latest stable release in its series."
+          fi
+
+      - name: Fail when the kernel check did not pass
+        if: steps.kernel.outputs.status != '0'
+        env:
+          CHECK_STATUS: ${{ steps.kernel.outputs.status }}
+        run: |
+          echo "Kernel version check failed with status $CHECK_STATUS" >&2
+          exit 1
