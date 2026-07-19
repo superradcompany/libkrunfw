@@ -38,6 +38,18 @@ make SEV=1
 sudo make SEV=1 install
 ```
 
+### CRC32C validation firmware
+
+The generic x86_64 firmware normally keeps crypto-manager run-time tests disabled to avoid adding validation work to every guest boot. To build a validation-only firmware that runs Linux's known-answer tests when each crypto implementation registers, start from a clean worktree and run:
+
+```sh
+make CRC32C_VALIDATION=1
+```
+
+Boot that firmware with `cryptomgr.panic_on_fail=1`, then run `scripts/verify-crc32c-runtime.sh accelerated` inside the guest. A successful boot plus the verifier proves that both `crc32c-intel` and `crc32c-generic` registered only after passing the upstream CRC32C vectors and that the accelerated driver has selection priority.
+
+Run a second boot with `cryptomgr.panic_on_fail=1 clearcpuid=148`, then run `scripts/verify-crc32c-runtime.sh fallback`. Linux feature 148 is SSE4.2, which the accelerated driver requires; hiding it proves that `crc32c-intel` declines registration and `crc32c-generic` remains available. This build flag does not modify the checked-in production configuration.
+
 ### macOS
 
 #### Requirements

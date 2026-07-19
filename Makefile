@@ -66,6 +66,15 @@ ifeq ($(OS),Windows)
     VARIANT := -windows
 endif
 
+ifeq ($(CRC32C_VALIDATION),1)
+ifneq ($(GUESTARCH),x86_64)
+$(error CRC32C_VALIDATION=1 is supported only for the x86_64 guest kernel)
+endif
+ifneq ($(VARIANT),)
+$(error CRC32C_VALIDATION=1 is supported only for the generic libkrunfw variant)
+endif
+endif
+
 KBUNDLE_TYPE_x86_64 = vmlinux
 KBUNDLE_TYPE_aarch64 = Image
 KBUNDLE_TYPE_riscv64 = Image
@@ -137,6 +146,11 @@ $(KERNEL_SOURCES): $(KERNEL_TARBALL)
 	tar xf $(KERNEL_TARBALL)
 	./scripts/apply-kernel-patches.sh $(KERNEL_SOURCES) $(KERNEL_PATCHES)
 	cp config-libkrunfw$(VARIANT)_$(GUESTARCH) $(KERNEL_SOURCES)/.config
+ifeq ($(CRC32C_VALIDATION),1)
+	# Validation firmware runs the upstream known-answer tests at algorithm registration. Production
+	# builds keep CONFIG_CRYPTO_MANAGER_DISABLE_TESTS=y and therefore retain their boot behavior.
+	cd $(KERNEL_SOURCES) ; scripts/config --disable CRYPTO_MANAGER_DISABLE_TESTS
+endif
 	cd $(KERNEL_SOURCES) ; $(MAKE) olddefconfig
 
 $(KERNEL_BINARY_$(GUESTARCH)): $(KERNEL_SOURCES)
