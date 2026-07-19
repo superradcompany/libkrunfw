@@ -59,6 +59,10 @@ jobs:
             runner: ubuntu-24.04
             packages: ""
             make_args: ""
+          - name: Linux x86_64 CRC32C validation
+            runner: ubuntu-24.04
+            packages: ""
+            make_args: CRC32C_VALIDATION=1
           - name: Windows x86_64
             runner: ubuntu-24.04
             packages: ""
