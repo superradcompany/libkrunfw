@@ -4,8 +4,9 @@ Subject: [PATCH 34/34] virtio: add microsandbox VM generation driver
 
 Add a built-in driver for the private microsandbox VM-generation device.
 When the host publishes a new generation, the driver synchronously mixes it
-through add_vmfork_randomness() and only then writes the exact processed
-sequence and identifier back to device config space.
+through add_vmfork_randomness(), applies requested wall-clock correction,
+and only then writes the exact processed sequence and identifier back to
+device config space. Clock reads latch fresh host time during processing.
 
 This gives VM clone and rollback users an event-driven completion boundary
 without polling or a userspace control round trip.
@@ -44,14 +45,14 @@ Signed-off-by: Microsandbox <development@superrad.company>
  virtio_rtc-$(CONFIG_VIRTIO_RTC_ARM) += virtio_rtc_arm.o
 --- /dev/null
 +++ b/drivers/virtio/virtio_msb_vmgenid.c
-@@ -0,0 +1,250 @@
+@@ -0,0 +1,305 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Microsandbox VM generation driver.
 + *
 + * The host owns the request fields. This driver owns the status and processed
-+ * fields, publishing an acknowledgement only after add_vmfork_randomness()
-+ * returns. All config fields are little-endian 32-bit words so virtio-mmio
++ * fields, acknowledging only after identity processing and requested clock
++ * correction. All config fields are little-endian 32-bit words so virtio-mmio
 + * never needs an unaligned or transport-specific wide access.
 + */
 +
@@ -59,6 +60,7 @@ Signed-off-by: Microsandbox <development@superrad.company>
 +#include <linux/random.h>
 +#include <linux/slab.h>
 +#include <linux/string.h>
++#include <linux/timekeeping.h>
 +#include <linux/virtio.h>
 +#include <linux/virtio_config.h>
 +#include <linux/virtio_ids.h>
@@ -67,6 +69,8 @@ Signed-off-by: Microsandbox <development@superrad.company>
 +#define MSB_VMGENID_VERSION		1
 +#define MSB_VMGENID_STATUS_READY	BIT(0)
 +#define MSB_VMGENID_STATUS_ERROR	BIT(1)
++#define MSB_VMGENID_STATUS_CLOCK	BIT(2)
++#define MSB_VMGENID_SYNC_CLOCK	BIT(0)
 +
 +struct virtio_msb_vmgenid_config {
 +	__le32 version;
@@ -77,6 +81,9 @@ Signed-off-by: Microsandbox <development@superrad.company>
 +	__le32 processed_sequence_low;
 +	__le32 processed_sequence_high;
 +	__le32 processed_id[4];
++	__le32 request_flags;
++	__le32 clock_low;
++	__le32 clock_high;
 +};
 +
 +struct msb_vmgenid_dev {
@@ -93,7 +100,7 @@ Signed-off-by: Microsandbox <development@superrad.company>
 +static u32 msb_vmgenid_read_word(struct virtio_device *vdev,
 +				 unsigned int offset)
 +{
-+	__le32 value;
++	__le32 value = 0;
 +
 +	vdev->config->get(vdev, offset, &value, sizeof(value));
 +	return le32_to_cpu(value);
@@ -179,6 +186,41 @@ Signed-off-by: Microsandbox <development@superrad.company>
 +		lower_32_bits(sequence));
 +}
 +
++/* Read a fresh, latched host sample. Bracket the transport read with the
++ * guest raw clock: midpoint compensation avoids installing the timestamp
++ * from request publication, which may precede resume by an arbitrary delay.
++ * Only this serialized work item reads the sample registers.
++ */
++static int msb_vmgenid_sync_clock(struct virtio_device *vdev)
++{
++	struct timespec64 target;
++	u64 before, after, now, sample;
++	u32 low, high;
++
++	before = ktime_get_raw_ns();
++	low = msb_vmgenid_read_word(vdev,
++		offsetof(struct virtio_msb_vmgenid_config, clock_low));
++	high = msb_vmgenid_read_word(vdev,
++		offsetof(struct virtio_msb_vmgenid_config, clock_high));
++	after = ktime_get_raw_ns();
++	sample = msb_vmgenid_join_sequence(low, high);
++	if (!sample || sample > S64_MAX || after < before ||
++	    (after - before) / 2 > S64_MAX - sample)
++		return -ERANGE;
++	sample += (after - before) / 2;
++
++	/* Wall time reconciles forward. Do not inject suspend time: planned
++	 * interruption does not advance MONOTONIC or BOOTTIME in this contract.
++	 * The core API updates vDSO time and notifies dependent timers before
++	 * returning; never edit private timekeeper fields from this driver.
++	 */
++	now = ktime_get_real_ns();
++	if (sample <= now)
++		return 0;
++	target = ns_to_timespec64(sample);
++	return do_settimeofday64(&target);
++}
++
 +static void msb_vmgenid_process(struct work_struct *work)
 +{
 +	struct msb_vmgenid_dev *gdev =
@@ -217,6 +259,20 @@ Signed-off-by: Microsandbox <development@superrad.company>
 +		}
 +
 +		add_vmfork_randomness(id, sizeof(id));
++		if (msb_vmgenid_read_word(gdev->vdev,
++		    offsetof(struct virtio_msb_vmgenid_config, request_flags)) &
++		    MSB_VMGENID_SYNC_CLOCK) {
++			int ret = msb_vmgenid_sync_clock(gdev->vdev);
++
++			if (ret) {
++				dev_err(&gdev->vdev->dev, "activation clock update failed: %d\n", ret);
++				msb_vmgenid_write_word(gdev->vdev,
++					offsetof(struct virtio_msb_vmgenid_config, driver_status),
++					MSB_VMGENID_STATUS_READY | MSB_VMGENID_STATUS_CLOCK |
++					MSB_VMGENID_STATUS_ERROR);
++				return;
++			}
++		}
 +		gdev->last_sequence = sequence;
 +		memcpy(gdev->last_id, id, sizeof(gdev->last_id));
 +		msb_vmgenid_publish_processed(gdev, sequence, id);
@@ -262,7 +318,7 @@ Signed-off-by: Microsandbox <development@superrad.company>
 +	virtio_device_ready(vdev);
 +	msb_vmgenid_write_word(vdev,
 +		offsetof(struct virtio_msb_vmgenid_config, driver_status),
-+		MSB_VMGENID_STATUS_READY);
++		MSB_VMGENID_STATUS_READY | MSB_VMGENID_STATUS_CLOCK);
 +	schedule_work(&gdev->process_work);
 +	return 0;
 +}
