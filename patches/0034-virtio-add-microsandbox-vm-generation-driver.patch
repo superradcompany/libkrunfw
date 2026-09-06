@@ -1,0 +1,363 @@
+From: Microsandbox <development@superrad.company>
+Date: Mon, 31 Aug 2026 12:00:00 +0100
+Subject: [PATCH 34/34] virtio: add microsandbox VM generation driver
+
+Add a built-in driver for the private microsandbox VM-generation device.
+When the host publishes a new generation, the driver synchronously mixes it
+through add_vmfork_randomness(), applies requested wall-clock correction,
+and only then writes the exact processed sequence and identifier back to
+device config space. Clock reads latch fresh host time during processing.
+
+This gives VM clone and rollback users an event-driven completion boundary
+without polling or a userspace control round trip.
+
+Signed-off-by: Microsandbox <development@superrad.company>
+---
+--- a/drivers/virtio/Kconfig
++++ b/drivers/virtio/Kconfig
+@@ -52,5 +52,17 @@ config VIRTIO_MSB_CPU
+ 	  host then reports CPU resizes as not converging.
+ 
++config VIRTIO_MSB_VMGENID
++	bool "Microsandbox VM generation virtio driver"
++	depends on VIRTIO
++	select VIRT_DRIVERS
++	select VMGENID
++	default y
++	help
++	  This driver mixes a host-published generation identifier into the
++	  guest kernel CRNG after a VM clone or rollback and reports completion
++	  to the host. It is intended for bundled microsandbox kernels; custom
++	  kernels may omit it and will not support resumable clone activation.
++
+ config VIRTIO_HARDEN_NOTIFICATION
+         bool "Harden virtio notification"
+         depends on BROKEN
+--- a/drivers/virtio/Makefile
++++ b/drivers/virtio/Makefile
+@@ -17,6 +17,7 @@ obj-$(CONFIG_VIRTIO_DEBUG) += virtio_debug.o
+ obj-$(CONFIG_VIRTIO_RTC) += virtio_rtc.o
+ obj-$(CONFIG_VIRTIO_MSB_METRICS) += virtio_msb_metrics.o
+ obj-$(CONFIG_VIRTIO_MSB_CPU) += virtio_msb_cpu.o
++obj-$(CONFIG_VIRTIO_MSB_VMGENID) += virtio_msb_vmgenid.o
+ virtio_rtc-y := virtio_rtc_driver.o
+ virtio_rtc-$(CONFIG_VIRTIO_RTC_PTP) += virtio_rtc_ptp.o
+ virtio_rtc-$(CONFIG_VIRTIO_RTC_ARM) += virtio_rtc_arm.o
+--- /dev/null
++++ b/drivers/virtio/virtio_msb_vmgenid.c
+@@ -0,0 +1,305 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Microsandbox VM generation driver.
++ *
++ * The host owns the request fields. This driver owns the status and processed
++ * fields, acknowledging only after identity processing and requested clock
++ * correction. All config fields are little-endian 32-bit words so virtio-mmio
++ * never needs an unaligned or transport-specific wide access.
++ */
++
++#include <linux/module.h>
++#include <linux/random.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/timekeeping.h>
++#include <linux/virtio.h>
++#include <linux/virtio_config.h>
++#include <linux/virtio_ids.h>
++#include <linux/workqueue.h>
++
++#define MSB_VMGENID_VERSION		1
++#define MSB_VMGENID_STATUS_READY	BIT(0)
++#define MSB_VMGENID_STATUS_ERROR	BIT(1)
++#define MSB_VMGENID_STATUS_CLOCK	BIT(2)
++#define MSB_VMGENID_SYNC_CLOCK	BIT(0)
++
++struct virtio_msb_vmgenid_config {
++	__le32 version;
++	__le32 driver_status;
++	__le32 request_sequence_low;
++	__le32 request_sequence_high;
++	__le32 generation_id[4];
++	__le32 processed_sequence_low;
++	__le32 processed_sequence_high;
++	__le32 processed_id[4];
++	__le32 request_flags;
++	__le32 clock_low;
++	__le32 clock_high;
++};
++
++struct msb_vmgenid_dev {
++	struct virtio_device *vdev;
++	/* The queue carries no data. Its allocation gives the virtio-mmio
++	 * transport the interrupt used for config-change notifications.
++	 */
++	struct virtqueue *vq;
++	struct work_struct process_work;
++	u64 last_sequence;
++	u8 last_id[16];
++};
++
++static u32 msb_vmgenid_read_word(struct virtio_device *vdev,
++				 unsigned int offset)
++{
++	__le32 value = 0;
++
++	vdev->config->get(vdev, offset, &value, sizeof(value));
++	return le32_to_cpu(value);
++}
++
++static void msb_vmgenid_write_word(struct virtio_device *vdev,
++				   unsigned int offset, u32 value)
++{
++	__le32 encoded = cpu_to_le32(value);
++
++	vdev->config->set(vdev, offset, &encoded, sizeof(encoded));
++}
++
++static u64 msb_vmgenid_join_sequence(u32 low, u32 high)
++{
++	return (u64)low | ((u64)high << 32);
++}
++
++static void msb_vmgenid_read_request(struct virtio_device *vdev,
++				     u64 *sequence, u8 id[16])
++{
++	u64 before, after;
++	u32 words[4];
++	unsigned int i;
++
++	/* A host update replaces all request fields under one device lock. The
++	 * double sequence read rejects a request assembled across two updates.
++	 */
++	do {
++		before = msb_vmgenid_join_sequence(
++			msb_vmgenid_read_word(vdev,
++				offsetof(struct virtio_msb_vmgenid_config,
++					 request_sequence_low)),
++			msb_vmgenid_read_word(vdev,
++				offsetof(struct virtio_msb_vmgenid_config,
++					 request_sequence_high)));
++		for (i = 0; i < ARRAY_SIZE(words); i++)
++			words[i] = msb_vmgenid_read_word(vdev,
++				offsetof(struct virtio_msb_vmgenid_config,
++					 generation_id) + i * sizeof(__le32));
++		after = msb_vmgenid_join_sequence(
++			msb_vmgenid_read_word(vdev,
++				offsetof(struct virtio_msb_vmgenid_config,
++					 request_sequence_low)),
++			msb_vmgenid_read_word(vdev,
++				offsetof(struct virtio_msb_vmgenid_config,
++					 request_sequence_high)));
++	} while (before != after);
++
++	for (i = 0; i < ARRAY_SIZE(words); i++) {
++		__le32 encoded = cpu_to_le32(words[i]);
++
++		memcpy(id + i * sizeof(encoded), &encoded, sizeof(encoded));
++	}
++	*sequence = after;
++}
++
++static void msb_vmgenid_publish_processed(struct msb_vmgenid_dev *gdev,
++					  u64 sequence, const u8 id[16])
++{
++	unsigned int i;
++
++	/* The low sequence word is the commit marker. Writing it last means a
++	 * host that observes the expected sequence can also consume the complete
++	 * identifier written before it.
++	 */
++	for (i = 0; i < 4; i++) {
++		__le32 encoded;
++
++		memcpy(&encoded, id + i * sizeof(encoded), sizeof(encoded));
++		msb_vmgenid_write_word(gdev->vdev,
++			offsetof(struct virtio_msb_vmgenid_config, processed_id) +
++				i * sizeof(__le32),
++			le32_to_cpu(encoded));
++	}
++	msb_vmgenid_write_word(gdev->vdev,
++		offsetof(struct virtio_msb_vmgenid_config,
++			 processed_sequence_high),
++		upper_32_bits(sequence));
++	msb_vmgenid_write_word(gdev->vdev,
++		offsetof(struct virtio_msb_vmgenid_config,
++			 processed_sequence_low),
++		lower_32_bits(sequence));
++}
++
++/* Read a fresh, latched host sample. Bracket the transport read with the
++ * guest raw clock: midpoint compensation avoids installing the timestamp
++ * from request publication, which may precede resume by an arbitrary delay.
++ * Only this serialized work item reads the sample registers.
++ */
++static int msb_vmgenid_sync_clock(struct virtio_device *vdev)
++{
++	struct timespec64 target;
++	u64 before, after, now, sample;
++	u32 low, high;
++
++	before = ktime_get_raw_ns();
++	low = msb_vmgenid_read_word(vdev,
++		offsetof(struct virtio_msb_vmgenid_config, clock_low));
++	high = msb_vmgenid_read_word(vdev,
++		offsetof(struct virtio_msb_vmgenid_config, clock_high));
++	after = ktime_get_raw_ns();
++	sample = msb_vmgenid_join_sequence(low, high);
++	if (!sample || sample > S64_MAX || after < before ||
++	    (after - before) / 2 > S64_MAX - sample)
++		return -ERANGE;
++	sample += (after - before) / 2;
++
++	/* Wall time reconciles forward. Do not inject suspend time: planned
++	 * interruption does not advance MONOTONIC or BOOTTIME in this contract.
++	 * The core API updates vDSO time and notifies dependent timers before
++	 * returning; never edit private timekeeper fields from this driver.
++	 */
++	now = ktime_get_real_ns();
++	if (sample <= now)
++		return 0;
++	target = ns_to_timespec64(sample);
++	return do_settimeofday64(&target);
++}
++
++static void msb_vmgenid_process(struct work_struct *work)
++{
++	struct msb_vmgenid_dev *gdev =
++		container_of(work, struct msb_vmgenid_dev, process_work);
++	u8 id[16];
++	u64 sequence;
++	u32 version;
++
++	version = msb_vmgenid_read_word(gdev->vdev,
++		offsetof(struct virtio_msb_vmgenid_config, version));
++	if (version != MSB_VMGENID_VERSION) {
++		msb_vmgenid_write_word(gdev->vdev,
++			offsetof(struct virtio_msb_vmgenid_config, driver_status),
++			MSB_VMGENID_STATUS_READY | MSB_VMGENID_STATUS_ERROR);
++		return;
++	}
++
++	for (;;) {
++		msb_vmgenid_read_request(gdev->vdev, &sequence, id);
++		if (!sequence)
++			return;
++
++		if (sequence < gdev->last_sequence) {
++			pr_warn_ratelimited("virtio_msb_vmgenid: stale request %llu after %llu\n",
++				(unsigned long long)sequence,
++				(unsigned long long)gdev->last_sequence);
++			return;
++		}
++		if (sequence == gdev->last_sequence) {
++			if (memcmp(id, gdev->last_id, sizeof(gdev->last_id))) {
++				pr_warn_ratelimited("virtio_msb_vmgenid: generation changed without a new sequence\n");
++				return;
++			}
++			msb_vmgenid_publish_processed(gdev, sequence, id);
++			return;
++		}
++
++		add_vmfork_randomness(id, sizeof(id));
++		if (msb_vmgenid_read_word(gdev->vdev,
++		    offsetof(struct virtio_msb_vmgenid_config, request_flags)) &
++		    MSB_VMGENID_SYNC_CLOCK) {
++			int ret = msb_vmgenid_sync_clock(gdev->vdev);
++
++			if (ret) {
++				dev_err(&gdev->vdev->dev, "activation clock update failed: %d\n", ret);
++				msb_vmgenid_write_word(gdev->vdev,
++					offsetof(struct virtio_msb_vmgenid_config, driver_status),
++					MSB_VMGENID_STATUS_READY | MSB_VMGENID_STATUS_CLOCK |
++					MSB_VMGENID_STATUS_ERROR);
++				return;
++			}
++		}
++		gdev->last_sequence = sequence;
++		memcpy(gdev->last_id, id, sizeof(gdev->last_id));
++		msb_vmgenid_publish_processed(gdev, sequence, id);
++
++		/* A config change racing this work item can be coalesced by the
++		 * workqueue. Re-read until the request we acknowledged remains current.
++		 */
++		msb_vmgenid_read_request(gdev->vdev, &sequence, id);
++		if (sequence == gdev->last_sequence &&
++		    !memcmp(id, gdev->last_id, sizeof(gdev->last_id)))
++			return;
++		cond_resched();
++	}
++}
++
++static void msb_vmgenid_config_changed(struct virtio_device *vdev)
++{
++	struct msb_vmgenid_dev *gdev = vdev->priv;
++
++	schedule_work(&gdev->process_work);
++}
++
++static int msb_vmgenid_probe(struct virtio_device *vdev)
++{
++	struct msb_vmgenid_dev *gdev;
++
++	gdev = kzalloc(sizeof(*gdev), GFP_KERNEL);
++	if (!gdev)
++		return -ENOMEM;
++
++	gdev->vdev = vdev;
++	INIT_WORK(&gdev->process_work, msb_vmgenid_process);
++	vdev->priv = gdev;
++
++	gdev->vq = virtio_find_single_vq(vdev, NULL, "unused");
++	if (IS_ERR(gdev->vq)) {
++		int error = PTR_ERR(gdev->vq);
++
++		kfree(gdev);
++		return error;
++	}
++
++	virtio_device_ready(vdev);
++	msb_vmgenid_write_word(vdev,
++		offsetof(struct virtio_msb_vmgenid_config, driver_status),
++		MSB_VMGENID_STATUS_READY | MSB_VMGENID_STATUS_CLOCK);
++	schedule_work(&gdev->process_work);
++	return 0;
++}
++
++static void msb_vmgenid_remove(struct virtio_device *vdev)
++{
++	struct msb_vmgenid_dev *gdev = vdev->priv;
++
++	virtio_reset_device(vdev);
++	cancel_work_sync(&gdev->process_work);
++	vdev->config->del_vqs(vdev);
++	kfree(gdev);
++}
++
++static const struct virtio_device_id id_table[] = {
++	{ VIRTIO_ID_MSB_VMGENID, VIRTIO_DEV_ANY_ID },
++	{ 0 },
++};
++
++static struct virtio_driver virtio_msb_vmgenid_driver = {
++	.driver.name = KBUILD_MODNAME,
++	.driver.owner = THIS_MODULE,
++	.id_table = id_table,
++	.probe = msb_vmgenid_probe,
++	.remove = msb_vmgenid_remove,
++	.config_changed = msb_vmgenid_config_changed,
++};
++
++module_virtio_driver(virtio_msb_vmgenid_driver);
++MODULE_DEVICE_TABLE(virtio, id_table);
++MODULE_DESCRIPTION("Microsandbox VM generation driver");
++MODULE_LICENSE("GPL");
+--- a/include/uapi/linux/virtio_ids.h
++++ b/include/uapi/linux/virtio_ids.h
+@@ -70,6 +70,7 @@
+ #define VIRTIO_ID_GPIO			41 /* virtio gpio */
+ #define VIRTIO_ID_MSB_METRICS		0x4d53 /* microsandbox metrics */
+ #define VIRTIO_ID_MSB_CPU		0x4d43 /* microsandbox cpu capacity */
++#define VIRTIO_ID_MSB_VMGENID		0x4d47 /* microsandbox VM generation */
+ 
+ /*
+  * Virtio Transitional IDs
