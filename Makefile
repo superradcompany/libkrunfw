@@ -1,4 +1,4 @@
-KERNEL_VERSION = linux-6.12.99
+KERNEL_VERSION = linux-6.12.108
 # Kernel source from the kernel.org CDN (static release tarball).
 KERNEL_REMOTE = https://cdn.kernel.org/pub/linux/kernel/v6.x/$(KERNEL_VERSION).tar.gz
 KERNEL_TARBALL = tarballs/$(KERNEL_VERSION).tar.gz
