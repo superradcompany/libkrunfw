@@ -13,6 +13,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  bundle-reuse:
+    name: Check cached kernel bundles
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v7
+
+      - name: Install bundle test dependency
+        run: sudo apt-get update && sudo apt-get install -y python3-pyelftools
+
+      - name: Check rebuild and Windows rejection paths
+        run: |
+          command -v pwsh
+          python3 -m unittest discover -s tests -p test_kernel_bundle.py -v
+
   freshness:
     name: Check stable kernel version
     runs-on: ubuntu-24.04

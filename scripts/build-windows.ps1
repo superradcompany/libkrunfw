@@ -415,6 +415,8 @@ if (-not (Test-Path -LiteralPath $kernelBundle)) {
     throw "kernel.c was not found. Build it with Docker first or provide an existing kernel.c."
 }
 
+& "$PSScriptRoot\check-kernel-bundle.ps1" -Source $kernelBundle
+
 if ($isTee) {
     if (-not (Test-Path -LiteralPath $qbootBundle)) {
         throw "qboot.c was not found. Build it with Docker first or omit -SkipKernelBundle."

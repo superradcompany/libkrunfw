@@ -52,6 +52,8 @@ This will create a lightweight Linux VM using ```krunvm``` with the current work
 make
 ```
 
+`make` rebuilds a stale or unversioned `kernel.c` through Docker before linking. If using krunvm instead, rerun `./build_on_krunvm.sh` after updating the kernel sources.
+
 By default, the build environment is based on a Fedora image. There is also a Debian variant which can be selected by setting the `BUILDER` environment variable.
 
 ```
@@ -75,7 +77,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-windows.
 
 Use `-DockerPlatform` to select a different Linux builder platform when intentionally producing a different guest kernel architecture.
 
-If `kernel.c` already exists, skip the Docker step and only link/verify the DLL:
+If `kernel.c` was generated for the currently pinned kernel, skip the Docker step and only link/verify the DLL. Stale or unversioned bundles are rejected; regenerate them without `-SkipKernelBundle`:
 
 ```
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1 -SkipKernelBundle

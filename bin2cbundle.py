@@ -1,4 +1,5 @@
 import argparse
+import re
 import sys
 
 from elftools.elf.elffile import ELFFile
@@ -165,7 +166,17 @@ def main() -> int:
         return -1
 
     ifile = open(args.input_file, 'rb')
+    kernel_version = None
+    if bundle_name == 'KERNEL':
+        banner = re.search(rb'Linux version ([0-9]+\.[0-9]+\.[0-9]+)(?:[-+][^\s\x00]*)? ', ifile.read())
+        if banner is None:
+            raise ValueError('Input has no Linux kernel version banner')
+        kernel_version = banner.group(1).decode('ascii')
+        ifile.seek(0)
+
     ofile = open(args.output_file, 'w')
+    if kernel_version is not None:
+        ofile.write('/* libkrunfw kernel version: {} */\n'.format(kernel_version))
 
     write_header(ofile, bundle_name, page_size)
 

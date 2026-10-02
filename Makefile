@@ -5,6 +5,7 @@ KERNEL_TARBALL = tarballs/$(KERNEL_VERSION).tar.gz
 KERNEL_SOURCES = $(KERNEL_VERSION)
 KERNEL_PATCHES = $(shell find patches/ -name "0*.patch" | sort)
 KERNEL_C_BUNDLE = kernel.c
+KERNEL_BUNDLE_HEADER = /* libkrunfw kernel version: $(patsubst linux-%,%,$(KERNEL_VERSION)) */
 
 ABI_VERSION = 5
 FULL_VERSION = 5.6.1
@@ -125,9 +126,18 @@ ifeq ($(TDX),1)
     INITRD_C_BUNDLE = initrd.c
 endif
 
-.PHONY: all install clean
+.PHONY: all install clean FORCE
 
 all: $(KRUNFW_BINARY_$(OS))
+
+# Inspect the bundle itself: copied artifacts can have newer timestamps than
+# the Makefile while still containing a kernel from an older release.
+ifeq ($(WINDOWS_HOST),)
+ifneq ($(shell head -n 1 $(KERNEL_C_BUNDLE) 2>/dev/null),$(KERNEL_BUNDLE_HEADER))
+$(KERNEL_C_BUNDLE): FORCE
+$(KRUNFW_BINARY_$(OS)): FORCE
+endif
+endif
 
 $(KERNEL_TARBALL):
 	@mkdir -p tarballs
@@ -144,10 +154,10 @@ $(KERNEL_BINARY_$(GUESTARCH)): $(KERNEL_SOURCES)
 
 ifeq ($(OS),Windows)
 ifneq ($(WINDOWS_HOST),)
-$(KERNEL_C_BUNDLE):
-	$(error Windows builds consume an existing kernel.c generated on Linux)
+$(KERNEL_C_BUNDLE): FORCE
+	powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/check-kernel-bundle.ps1
 else
-$(KERNEL_C_BUNDLE): $(KERNEL_BINARY_$(GUESTARCH))
+$(KERNEL_C_BUNDLE): $(KERNEL_BINARY_$(GUESTARCH)) bin2cbundle.py
 	@echo "Generating $(KERNEL_C_BUNDLE) from $(KERNEL_BINARY_$(GUESTARCH))..."
 	@python3 bin2cbundle.py --os $(OS) -t $(KBUNDLE_TYPE_$(GUESTARCH)) $(KERNEL_BINARY_$(GUESTARCH)) kernel.c
 endif
@@ -155,8 +165,9 @@ else ifeq ($(OS),Darwin)
 $(KERNEL_C_BUNDLE):
 	@echo "Building on macOS, using ./build_in_docker.sh"
 	./build_in_docker.sh
+	@test "$$(head -n 1 $(KERNEL_C_BUNDLE))" = '$(KERNEL_BUNDLE_HEADER)' || { echo "Kernel bundle version mismatch; rebuild kernel.c" >&2; exit 1; }
 else
-$(KERNEL_C_BUNDLE): $(KERNEL_BINARY_$(GUESTARCH))
+$(KERNEL_C_BUNDLE): $(KERNEL_BINARY_$(GUESTARCH)) bin2cbundle.py
 	@echo "Generating $(KERNEL_C_BUNDLE) from $(KERNEL_BINARY_$(GUESTARCH))..."
 	@python3 bin2cbundle.py --os $(OS) -t $(KBUNDLE_TYPE_$(GUESTARCH)) $(KERNEL_BINARY_$(GUESTARCH)) kernel.c
 endif
@@ -205,3 +216,5 @@ endif
 
 clean:
 	rm -fr $(KERNEL_SOURCES) $(KERNEL_C_BUNDLE) $(QBOOT_C_BUNDLE) $(INITRD_C_BUNDLE) $(KRUNFW_BINARY_$(OS)) $(KRUNFW_IMPLIB_$(OS))
+
+FORCE:
