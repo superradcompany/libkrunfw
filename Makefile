@@ -126,7 +126,7 @@ ifeq ($(TDX),1)
     INITRD_C_BUNDLE = initrd.c
 endif
 
-.PHONY: all install clean FORCE
+.PHONY: all install clean FORCE check-kernel-bundle
 
 all: $(KRUNFW_BINARY_$(OS))
 
@@ -154,7 +154,9 @@ $(KERNEL_BINARY_$(GUESTARCH)): $(KERNEL_SOURCES)
 
 ifeq ($(OS),Windows)
 ifneq ($(WINDOWS_HOST),)
-$(KERNEL_C_BUNDLE): FORCE
+$(KERNEL_C_BUNDLE): | check-kernel-bundle
+
+check-kernel-bundle:
 	powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/check-kernel-bundle.ps1
 else
 $(KERNEL_C_BUNDLE): $(KERNEL_BINARY_$(GUESTARCH)) bin2cbundle.py
