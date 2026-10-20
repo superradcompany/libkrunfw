@@ -2,6 +2,16 @@
 
 set -euo pipefail
 
+update=false
+if [[ ${1:-} == --update ]]; then
+    update=true
+    shift
+fi
+if (( $# > 1 )); then
+    echo "Usage: $0 [--update] [MAKEFILE]" >&2
+    exit 2
+fi
+
 makefile=${1:-Makefile}
 stable_repo=${KERNEL_STABLE_REPO:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}
 
@@ -47,6 +57,32 @@ echo "current=$current"
 echo "latest=$latest"
 
 if [[ $current != "$latest" ]]; then
-    echo "Kernel $current is not the latest ${series}.y release; update to $latest" >&2
-    exit 1
+    if [[ $update == false ]]; then
+        echo "Kernel $current is not the latest ${series}.y release; update to $latest" >&2
+        exit 1
+    fi
+
+    # A stale mirror must never turn an automated update into a kernel downgrade.
+    if (( 10#${current##*.} > 10#${latest##*.} )); then
+        echo "Refusing to downgrade kernel $current to $latest" >&2
+        exit 2
+    fi
+
+    python3 - "$makefile" "$current" "$latest" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+current, latest = sys.argv[2:]
+source = path.read_text()
+# Preserve comments and formatting, and refuse ambiguous version declarations.
+pattern = r"(?m)^([ \t]*KERNEL_VERSION[ \t]*=[ \t]*)linux-([0-9]+\.[0-9]+\.[0-9]+)(?=[ \t]*(?:#.*)?$)"
+matches = list(re.finditer(pattern, source))
+if len(matches) != 1 or matches[0].group(2) != current:
+    sys.exit("Expected exactly one unchanged KERNEL_VERSION assignment")
+updated = re.sub(pattern, lambda match: match.group(1) + "linux-" + latest, source)
+path.write_text(updated)
+PY
+    echo "Updated kernel $current to $latest" >&2
 fi

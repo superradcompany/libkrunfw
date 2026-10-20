@@ -35,6 +35,9 @@ jobs:
       - name: Code checkout
         uses: actions/checkout@v7
 
+      - name: Test kernel update automation
+        run: python3 -m unittest discover -s tests -p test_kernel_update.py -v
+
       - name: Check pinned kernel
         run: scripts/check-kernel-version.sh
 

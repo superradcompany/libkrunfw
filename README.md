@@ -138,6 +138,14 @@ Update the host and firmware together and boot a fresh guest to use this handler
 | aarch64        | 16         |
 | riscv64        | 16         |
 
+## Automated kernel updates
+
+The Kernel version monitor checks kernel.org daily at 07:17 UTC for newer patch releases in the pinned stable series. It opens or refreshes a single PR from `appcypher/kernel-stable-update`, changes only `KERNEL_VERSION` in `Makefile`, and signs the update commits through GitHub. The branch is maintained by automation; prepare any required patch repairs separately so a later refresh does not replace them.
+
+The monitor explicitly dispatches Kernel CI on the update branch, which builds all six configurations: Linux x86_64, Windows x86_64, SEV x86_64, TDX x86_64, Linux aarch64, and Linux riscv64. An unchanged PR revision is not rebuilt daily; cancelled or skipped runs can be dispatched again. Failed builds remain available for review and can be rerun through GitHub Actions. Updates require a maintainer to review and merge; auto-merge is not enabled.
+
+The workflow uses `GITHUB_TOKEN` with contents, pull requests, and Actions write permissions. Enable **Allow GitHub Actions to create and approve pull requests** in the repository's Actions settings. No personal token, signing secret, or enabled issue tracker is required. The existing PR freshness check still rejects an outdated kernel.
+
 ## License
 
 This library bundles a Linux kernel but does not execute any code from it, acting as a mere storage format. As a consequence, this library does not constitute a derivative work of the Linux kernel. Thus, the following licenses apply:
