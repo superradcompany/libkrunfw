@@ -1,4 +1,4 @@
-"""Exercise kernel update preparation and dispatch without accessing GitHub."""
+"""Exercise kernel updates offline; dispatch tests require jq on PATH."""
 
 import json
 import os
@@ -35,7 +35,7 @@ class KernelUpdateTests(unittest.TestCase):
             "GITHUB_REPOSITORY": "example/libkrunfw",
             "FAKE_TAGS": "6.12.9\n6.12.10",
             "FAKE_GIT_STATUS": "0",
-            "FAKE_GH_RUN_COUNT": "0",
+            "FAKE_GH_RUNS": json.dumps({"workflow_runs": []}),
             "FAKE_GH_QUERY_STATUS": "0",
             "FAKE_GH_DISPATCH_STATUS": "0",
         }
@@ -53,8 +53,15 @@ sys.exit(int(os.environ["FAKE_GIT_STATUS"]))
             "gh",
             """
 if sys.argv[1] == "api":
-    print(os.environ["FAKE_GH_RUN_COUNT"])
-    sys.exit(int(os.environ["FAKE_GH_QUERY_STATUS"]))
+    status = int(os.environ["FAKE_GH_QUERY_STATUS"])
+    if status:
+        sys.exit(status)
+    # Mock the API response, but evaluate the actual filter passed by the script.
+    query = sys.argv[sys.argv.index("--jq") + 1]
+    result = subprocess.run(
+        ["jq", "-r", query], input=os.environ["FAKE_GH_RUNS"], text=True
+    )
+    sys.exit(result.returncode)
 if sys.argv[1:3] == ["workflow", "run"]:
     sys.exit(int(os.environ["FAKE_GH_DISPATCH_STATUS"]))
 sys.exit("Unexpected GitHub mutation or invocation")
@@ -65,7 +72,7 @@ sys.exit("Unexpected GitHub mutation or invocation")
         executable = self.directory / name
         executable.write_text(
             "#!/usr/bin/env python3\n"
-            "import json, os, sys\n"
+            "import json, os, subprocess, sys\n"
             'with open(os.environ["COMMAND_LOG"], "a") as log:\n'
             "    log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
             + body
@@ -93,6 +100,16 @@ sys.exit("Unexpected GitHub mutation or invocation")
 
     def commands(self):
         return [json.loads(line) for line in self.log.read_text().splitlines()]
+
+    def assert_dispatch_for_runs(self, runs, expected):
+        self.env["FAKE_GH_RUNS"] = json.dumps({"workflow_runs": runs})
+        self.log.unlink(missing_ok=True)
+        result = self.run_dispatch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = self.commands()
+        dispatches = [command for command in commands if command[:2] == ["workflow", "run"]]
+        self.assertEqual(len(dispatches), int(expected))
+        self.assertEqual(len(commands), 1 + int(expected))
 
     def test_check_still_rejects_outdated_kernel_without_editing(self):
         result = self.run_check()
@@ -189,10 +206,60 @@ sys.exit("Unexpected GitHub mutation or invocation")
         )
 
     def test_existing_revision_does_not_dispatch_duplicate_builds(self):
-        self.env["FAKE_GH_RUN_COUNT"] = "1"
-        result = self.run_dispatch()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(self.commands()), 1)
+        self.assert_dispatch_for_runs(
+            [{"status": "completed", "conclusion": "success"}], expected=False
+        )
+
+    def test_cancelled_run_is_retried(self):
+        self.assert_dispatch_for_runs(
+            [{"status": "completed", "conclusion": "cancelled"}], expected=True
+        )
+
+    def test_skipped_run_is_retried(self):
+        self.assert_dispatch_for_runs(
+            [{"status": "completed", "conclusion": "skipped"}], expected=True
+        )
+
+    def test_queued_run_is_not_redispatched(self):
+        self.assert_dispatch_for_runs(
+            [{"status": "queued", "conclusion": None}], expected=False
+        )
+
+    def test_running_run_is_not_redispatched(self):
+        self.assert_dispatch_for_runs(
+            [{"status": "in_progress", "conclusion": None}], expected=False
+        )
+
+    def test_failed_build_is_not_redispatched(self):
+        self.assert_dispatch_for_runs(
+            [{"status": "completed", "conclusion": "failure"}], expected=False
+        )
+
+    def test_only_cancelled_and_skipped_runs_are_retried(self):
+        self.assert_dispatch_for_runs(
+            [
+                {"status": "completed", "conclusion": "cancelled"},
+                {"status": "completed", "conclusion": "skipped"},
+            ],
+            expected=True,
+        )
+
+    def test_existing_run_blocks_retry_after_cancelled_or_skipped_runs(self):
+        for status, conclusion in [
+            ("queued", None),
+            ("in_progress", None),
+            ("completed", "success"),
+            ("completed", "failure"),
+        ]:
+            with self.subTest(status=status, conclusion=conclusion):
+                self.assert_dispatch_for_runs(
+                    [
+                        {"status": "completed", "conclusion": "cancelled"},
+                        {"status": status, "conclusion": conclusion},
+                        {"status": "completed", "conclusion": "skipped"},
+                    ],
+                    expected=False,
+                )
 
     def test_failed_run_lookup_does_not_dispatch_blindly(self):
         self.env["FAKE_GH_QUERY_STATUS"] = "1"
