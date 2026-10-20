@@ -1,0 +1,259 @@
+From: Microsandbox <development@superrad.company>
+Subject: [PATCH] virtio: expose guest resource readiness observations
+
+Add optional read-only sysfs records for driver-quiescent memory and CPU
+readiness. Keep device layouts and hotplug policy unchanged. Pending
+work returns EAGAIN instead of a settled observation. Hosts must fence
+records with runtime/operation identity before using them.
+
+Signed-off-by: Microsandbox <development@superrad.company>
+---
+--- a/drivers/virtio/virtio_mem.c
++++ b/drivers/virtio/virtio_mem.c
+@@ -233,6 +233,8 @@
+ 	 * last_block_plugged.
+ 	 */
+ 	struct mutex hotplug_mutex;
++	/* Serialize read-only readiness snapshots against the whole resize worker. */
++	struct mutex readiness_mutex;
+ 	bool hotplug_active;
+ 
+ 	/* An error occurred we cannot handle - stop processing requests. */
+@@ -2427,6 +2429,7 @@
+ 	if (vm->broken)
+ 		return;
+ 
++	mutex_lock(&vm->readiness_mutex);
+ 	atomic_set(&vm->wq_active, 1);
+ retry:
+ 	rc = 0;
+@@ -2497,6 +2500,7 @@
+ 	}
+ 
+ 	atomic_set(&vm->wq_active, 0);
++	mutex_unlock(&vm->readiness_mutex);
+ }
+ 
+ static enum hrtimer_restart virtio_mem_timer_expired(struct hrtimer *timer)
+@@ -2837,6 +2841,78 @@
+ 				   virtio_mem_range_has_system_ram) == 1;
+ }
+ 
++/*
++ * This is a guest observation, not an operation acknowledgement. A host must
++ * fence it with its runtime/resize generation and compare the reported device
++ * range and target with the same request. No existing virtio field is changed.
++ *
++ * The worker changes some counters outside hotplug_mutex. A separate mutex
++ * excludes the entire worker; hotplug_mutex then excludes memory notifiers.
++ * Never wait for either from sysfs: in-progress hotplug is unavailable evidence.
++ */
++static ssize_t msb_memory_readiness_show(struct device *dev,
++					struct device_attribute *attr, char *buf)
++{
++	struct virtio_device *vdev = container_of(dev, struct virtio_device, dev);
++	struct virtio_mem *vm = vdev->priv;
++	unsigned long id;
++	bool all_online = true;
++	ssize_t rc = -EAGAIN;
++
++	if (vm->in_kdump)
++		return -EOPNOTSUPP;
++	if (!mutex_trylock(&vm->readiness_mutex))
++		return -EAGAIN;
++	if (!mutex_trylock(&vm->hotplug_mutex))
++		goto out_worker;
++	if (vm->removing || vm->broken) {
++		rc = -EIO;
++		goto out_hotplug;
++	}
++	if (atomic_read(&vm->config_changed) || work_pending(&vm->wq))
++		goto out_hotplug;
++
++	if (vm->in_sbm) {
++		for (id = vm->sbm.first_mb_id; id < vm->sbm.next_mb_id; id++) {
++			switch (virtio_mem_sbm_get_mb_state(vm, id)) {
++			case VIRTIO_MEM_SBM_MB_PLUGGED:
++			case VIRTIO_MEM_SBM_MB_OFFLINE:
++			case VIRTIO_MEM_SBM_MB_OFFLINE_PARTIAL:
++				/* An empty offline block is not unavailable capacity. */
++				if (!virtio_mem_sbm_test_sb_unplugged(vm, id, 0,
++								 vm->sbm.sbs_per_mb))
++					all_online = false;
++				break;
++			default:
++				break;
++			}
++			if (!all_online)
++				break;
++		}
++	} else {
++		/* BBM adds/removes entire big blocks. offline_size accounts for
++		 * individual Linux blocks; fake-offline pages are not allocatable.
++		 */
++		all_online = !vm->bbm.bb_count[VIRTIO_MEM_BBM_BB_PLUGGED] &&
++			!vm->bbm.bb_count[VIRTIO_MEM_BBM_BB_FAKE_OFFLINE] &&
++			!atomic64_read(&vm->offline_size);
++	}
++
++	/* An IRQ may queue another target while the read-only locks are held. */
++	if (atomic_read(&vm->config_changed) || work_pending(&vm->wq))
++		goto out_hotplug;
++	rc = sysfs_emit(buf, "schema=1 addr=%llu region_size=%llu "
++			"requested_size=%llu plugged_size=%llu all_online=%u\n",
++			vm->addr, vm->region_size, vm->requested_size,
++			vm->plugged_size, all_online);
++out_hotplug:
++	mutex_unlock(&vm->hotplug_mutex);
++out_worker:
++	mutex_unlock(&vm->readiness_mutex);
++	return rc;
++}
++static DEVICE_ATTR_RO(msb_memory_readiness);
++
+ static int virtio_mem_probe(struct virtio_device *vdev)
+ {
+ 	struct virtio_mem *vm;
+@@ -2853,6 +2929,7 @@
+ 	vm->vdev = vdev;
+ 	INIT_WORK(&vm->wq, virtio_mem_run_wq);
+ 	mutex_init(&vm->hotplug_mutex);
++	mutex_init(&vm->readiness_mutex);
+ 	INIT_LIST_HEAD(&vm->next);
+ 	spin_lock_init(&vm->removal_lock);
+ 	hrtimer_init(&vm->retry_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+@@ -2877,6 +2954,10 @@
+ 		atomic_set(&vm->config_changed, 1);
+ 		queue_work(system_freezable_wq, &vm->wq);
+ 	}
++
++	/* Observation is optional: exposing it must never make hotplug fail. */
++	if (device_create_file(&vdev->dev, &dev_attr_msb_memory_readiness))
++		dev_warn(&vdev->dev, "memory readiness observation unavailable\n");
+ 
+ 	return 0;
+ out_del_vq:
+@@ -2965,6 +3046,8 @@
+ {
+ 	struct virtio_mem *vm = vdev->priv;
+ 
++	device_remove_file(&vdev->dev, &dev_attr_msb_memory_readiness);
++
+ 	if (vm->in_kdump)
+ 		virtio_mem_deinit_kdump(vm);
+ 	else
+--- a/drivers/virtio/virtio_msb_cpu.c
++++ b/drivers/virtio/virtio_msb_cpu.c
+@@ -12,6 +12,7 @@
+ 
+ #include <linux/cpu.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/slab.h>
+ #include <linux/virtio.h>
+ #include <linux/virtio_config.h>
+@@ -31,6 +32,7 @@
+ 	 */
+ 	struct virtqueue *vq;
+ 	struct work_struct converge_work;
++	struct mutex readiness_mutex;
+ };
+ 
+ static void msb_cpu_set_online(unsigned int cpu, bool online)
+@@ -54,6 +56,7 @@
+ 	u32 possible, requested, online;
+ 	unsigned int cpu;
+ 
++	mutex_lock(&cdev->readiness_mutex);
+ 	virtio_cread_le(cdev->vdev, struct virtio_msb_cpu_config, possible,
+ 			&possible);
+ 	virtio_cread_le(cdev->vdev, struct virtio_msb_cpu_config,
+@@ -73,6 +76,7 @@
+ 	online = num_online_cpus();
+ 	virtio_cwrite_le(cdev->vdev, struct virtio_msb_cpu_config,
+ 			 actual_online, &online);
++	mutex_unlock(&cdev->readiness_mutex);
+ }
+ 
+ static void msb_cpu_config_changed(struct virtio_device *vdev)
+@@ -81,6 +85,55 @@
+ 
+ 	schedule_work(&cdev->converge_work);
+ }
++
++/*
++ * Report the exact online set, not just its count: an online CPU above the
++ * host-enforced prefix cannot substitute for an offline CPU below that prefix.
++ * Runtime operation fencing is still required around this guest observation.
++ */
++static ssize_t msb_cpu_readiness_show(struct device *dev,
++				     struct device_attribute *attr, char *buf)
++{
++	struct virtio_device *vdev = container_of(dev, struct virtio_device, dev);
++	struct msb_cpu_dev *cdev = vdev->priv;
++	u32 possible, requested, online;
++	unsigned int cpu;
++	bool exact = true;
++	ssize_t rc = -EAGAIN;
++
++	if (!mutex_trylock(&cdev->readiness_mutex))
++		return -EAGAIN;
++	if (!cpus_read_trylock())
++		goto out_worker;
++	if (work_pending(&cdev->converge_work))
++		goto out_cpus;
++	virtio_cread_le(vdev, struct virtio_msb_cpu_config, possible, &possible);
++	virtio_cread_le(vdev, struct virtio_msb_cpu_config,
++			requested_online, &requested);
++	if (!possible || !requested || requested > possible) {
++		rc = -EPROTO;
++		goto out_cpus;
++	}
++	online = num_online_cpus();
++	for_each_online_cpu(cpu) {
++		if (cpu >= requested) {
++			exact = false;
++			break;
++		}
++	}
++	exact = exact && online == requested;
++	if (work_pending(&cdev->converge_work))
++		goto out_cpus;
++	rc = sysfs_emit(buf, "schema=1 possible=%u requested_online=%u "
++			"actual_online=%u exact=%u\n", possible, requested,
++			online, exact);
++out_cpus:
++	cpus_read_unlock();
++out_worker:
++	mutex_unlock(&cdev->readiness_mutex);
++	return rc;
++}
++static DEVICE_ATTR_RO(msb_cpu_readiness);
+ 
+ static int msb_cpu_probe(struct virtio_device *vdev)
+ {
+@@ -92,6 +145,7 @@
+ 
+ 	cdev->vdev = vdev;
+ 	INIT_WORK(&cdev->converge_work, msb_cpu_converge);
++	mutex_init(&cdev->readiness_mutex);
+ 	vdev->priv = cdev;
+ 
+ 	cdev->vq = virtio_find_single_vq(vdev, NULL, "unused");
+@@ -108,12 +162,16 @@
+ 	 * finished; this also publishes the initial actual_online count.
+ 	 */
+ 	schedule_work(&cdev->converge_work);
++	if (device_create_file(&vdev->dev, &dev_attr_msb_cpu_readiness))
++		dev_warn(&vdev->dev, "CPU readiness observation unavailable\n");
+ 	return 0;
+ }
+ 
+ static void msb_cpu_remove(struct virtio_device *vdev)
+ {
+ 	struct msb_cpu_dev *cdev = vdev->priv;
++
++	device_remove_file(&vdev->dev, &dev_attr_msb_cpu_readiness);
+ 
+ 	virtio_reset_device(vdev);
+ 	cancel_work_sync(&cdev->converge_work);

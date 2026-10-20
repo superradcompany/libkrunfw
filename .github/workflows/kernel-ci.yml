@@ -20,13 +20,13 @@ jobs:
       - name: Code checkout
         uses: actions/checkout@v7
 
-      - name: Install bundle test dependency
-        run: sudo apt-get update && sudo apt-get install -y python3-pyelftools
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3-pyelftools gcc
 
-      - name: Check rebuild and Windows rejection paths
+      - name: Check bundle paths and resource readiness
         run: |
           command -v pwsh
-          python3 -m unittest discover -s tests -p test_kernel_bundle.py -v
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
 
   freshness:
     name: Check stable kernel version
