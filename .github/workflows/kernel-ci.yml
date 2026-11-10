@@ -13,6 +13,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  config-parity:
+    name: Check Windows kernel feature parity
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v7
+
+      - name: Compare generic and Windows x86_64 configs
+        run: python3 -m unittest discover -s tests -p test_kernel_config.py -v
+
   bundle-reuse:
     name: Check cached kernel bundles
     runs-on: ubuntu-24.04
@@ -43,7 +53,7 @@ jobs:
 
   source:
     name: Fetch kernel source
-    needs: freshness
+    needs: [freshness, config-parity]
     runs-on: ubuntu-24.04
     steps:
       - name: Code checkout
