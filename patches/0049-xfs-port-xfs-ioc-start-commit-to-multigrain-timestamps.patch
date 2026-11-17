@@ -1,0 +1,52 @@
+From 12f2930f5f91bc0d67794c69d1961098c7c72040 Mon Sep 17 00:00:00 2001
+From: "Darrick J. Wong" <djwong@kernel.org>
+Date: Mon, 2 Dec 2024 10:58:11 -0800
+Subject: [PATCH] xfs: port xfs_ioc_start_commit to multigrain timestamps
+
+Take advantage of the multigrain timestamp APIs to ensure that nobody
+can sneak in and write things to a file between starting a file update
+operation and committing the results.  This should have been part of the
+multigrain timestamp merge, but I forgot to fling it at jlayton when he
+resubmitted the patchset due to developer bandwidth problems.
+
+Cc: <stable@vger.kernel.org> # v6.13-rc1
+Fixes: 4e40eff0b5737c ("fs: add infrastructure for multigrain timestamps")
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Jeff Layton <jlayton@kernel.org>
+---
+ fs/xfs/xfs_exchrange.c | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/fs/xfs/xfs_exchrange.c b/fs/xfs/xfs_exchrange.c
+index 9ab05ad224d127..265c424498933e 100644
+--- a/fs/xfs/xfs_exchrange.c
++++ b/fs/xfs/xfs_exchrange.c
+@@ -854,7 +854,7 @@ xfs_ioc_start_commit(
+ 	struct xfs_commit_range __user	*argp)
+ {
+ 	struct xfs_commit_range		args = { };
+-	struct timespec64		ts;
++	struct kstat			kstat = { };
+ 	struct xfs_commit_range_fresh	*kern_f;
+ 	struct xfs_commit_range_fresh	__user *user_f;
+ 	struct inode			*inode2 = file_inode(file);
+@@ -871,12 +871,12 @@ xfs_ioc_start_commit(
+ 	memcpy(&kern_f->fsid, ip2->i_mount->m_fixedfsid, sizeof(xfs_fsid_t));
+ 
+ 	xfs_ilock(ip2, lockflags);
+-	ts = inode_get_ctime(inode2);
+-	kern_f->file2_ctime		= ts.tv_sec;
+-	kern_f->file2_ctime_nsec	= ts.tv_nsec;
+-	ts = inode_get_mtime(inode2);
+-	kern_f->file2_mtime		= ts.tv_sec;
+-	kern_f->file2_mtime_nsec	= ts.tv_nsec;
++	/* Force writing of a distinct ctime if any writes happen. */
++	fill_mg_cmtime(&kstat, STATX_CTIME | STATX_MTIME, inode2);
++	kern_f->file2_ctime		= kstat.ctime.tv_sec;
++	kern_f->file2_ctime_nsec	= kstat.ctime.tv_nsec;
++	kern_f->file2_mtime		= kstat.mtime.tv_sec;
++	kern_f->file2_mtime_nsec	= kstat.mtime.tv_nsec;
+ 	kern_f->file2_ino		= ip2->i_ino;
+ 	kern_f->file2_gen		= inode2->i_generation;
+ 	kern_f->magic			= XCR_FRESH_MAGIC;

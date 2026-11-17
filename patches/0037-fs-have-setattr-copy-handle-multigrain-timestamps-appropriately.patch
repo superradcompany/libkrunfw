@@ -1,0 +1,107 @@
+From b82f92d5dd1a365ab1e13518c8bf799f6fec4518 Mon Sep 17 00:00:00 2001
+From: Jeff Layton <jlayton@kernel.org>
+Date: Wed, 2 Oct 2024 17:27:19 -0400
+Subject: [PATCH] fs: have setattr_copy handle multigrain timestamps
+ appropriately
+
+The setattr codepath is still using coarse-grained timestamps, even on
+multigrain filesystems. To fix this, fetch the timestamp for ctime
+updates later, at the point where the assignment occurs in setattr_copy.
+
+On a multigrain inode, ignore the ia_ctime in the attrs, and always
+update the ctime to the current clock value. Update the atime and mtime
+with the same value (if needed) unless they are being set to other
+specific values, a'la utimes().
+
+Do not do this universally however, as some filesystems (e.g. most
+networked fs) want to do an explicit update elsewhere before updating
+the local inode.
+
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Tested-by: Randy Dunlap <rdunlap@infradead.org> # documentation bits
+Signed-off-by: Jeff Layton <jlayton@kernel.org>
+Link: https://lore.kernel.org/r/20241002-mgtime-v10-4-d1c4717f5284@kernel.org
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+---
+ fs/attr.c | 52 ++++++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 46 insertions(+), 6 deletions(-)
+
+diff --git a/fs/attr.c b/fs/attr.c
+index c04d19b58f1224..0309c2bd8afa04 100644
+--- a/fs/attr.c
++++ b/fs/attr.c
+@@ -271,6 +271,42 @@ int inode_newsize_ok(const struct inode *inode, loff_t offset)
+ }
+ EXPORT_SYMBOL(inode_newsize_ok);
+ 
++/**
++ * setattr_copy_mgtime - update timestamps for mgtime inodes
++ * @inode: inode timestamps to be updated
++ * @attr: attrs for the update
++ *
++ * With multigrain timestamps, take more care to prevent races when
++ * updating the ctime. Always update the ctime to the very latest using
++ * the standard mechanism, and use that to populate the atime and mtime
++ * appropriately (unless those are being set to specific values).
++ */
++static void setattr_copy_mgtime(struct inode *inode, const struct iattr *attr)
++{
++	unsigned int ia_valid = attr->ia_valid;
++	struct timespec64 now;
++
++	/*
++	 * If the ctime isn't being updated then nothing else should be
++	 * either.
++	 */
++	if (!(ia_valid & ATTR_CTIME)) {
++		WARN_ON_ONCE(ia_valid & (ATTR_ATIME|ATTR_MTIME));
++		return;
++	}
++
++	now = inode_set_ctime_current(inode);
++	if (ia_valid & ATTR_ATIME_SET)
++		inode_set_atime_to_ts(inode, attr->ia_atime);
++	else if (ia_valid & ATTR_ATIME)
++		inode_set_atime_to_ts(inode, now);
++
++	if (ia_valid & ATTR_MTIME_SET)
++		inode_set_mtime_to_ts(inode, attr->ia_mtime);
++	else if (ia_valid & ATTR_MTIME)
++		inode_set_mtime_to_ts(inode, now);
++}
++
+ /**
+  * setattr_copy - copy simple metadata updates into the generic inode
+  * @idmap:	idmap of the mount the inode was found from
+@@ -303,12 +339,6 @@ void setattr_copy(struct mnt_idmap *idmap, struct inode *inode,
+ 
+ 	i_uid_update(idmap, attr, inode);
+ 	i_gid_update(idmap, attr, inode);
+-	if (ia_valid & ATTR_ATIME)
+-		inode_set_atime_to_ts(inode, attr->ia_atime);
+-	if (ia_valid & ATTR_MTIME)
+-		inode_set_mtime_to_ts(inode, attr->ia_mtime);
+-	if (ia_valid & ATTR_CTIME)
+-		inode_set_ctime_to_ts(inode, attr->ia_ctime);
+ 	if (ia_valid & ATTR_MODE) {
+ 		umode_t mode = attr->ia_mode;
+ 		if (!in_group_or_capable(idmap, inode,
+@@ -316,6 +346,16 @@ void setattr_copy(struct mnt_idmap *idmap, struct inode *inode,
+ 			mode &= ~S_ISGID;
+ 		inode->i_mode = mode;
+ 	}
++
++	if (is_mgtime(inode))
++		return setattr_copy_mgtime(inode, attr);
++
++	if (ia_valid & ATTR_ATIME)
++		inode_set_atime_to_ts(inode, attr->ia_atime);
++	if (ia_valid & ATTR_MTIME)
++		inode_set_mtime_to_ts(inode, attr->ia_mtime);
++	if (ia_valid & ATTR_CTIME)
++		inode_set_ctime_to_ts(inode, attr->ia_ctime);
+ }
+ EXPORT_SYMBOL(setattr_copy);
+ 
