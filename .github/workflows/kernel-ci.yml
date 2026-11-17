@@ -128,3 +128,10 @@ jobs:
         env:
           MAKE_ARGS: ${{ matrix.make_args }}
         run: make -j"$(nproc)" $MAKE_ARGS kernel.c
+
+      - name: Test multigrain timestamps in the ARM64 guest
+        if: matrix.name == 'Linux aarch64'
+        run: |
+          sudo apt-get install -y --no-install-recommends busybox-static qemu-system-arm e2fsprogs xfsprogs btrfs-progs
+          kernel_version=$(awk '$1 == "KERNEL_VERSION" { print $3; exit }' Makefile)
+          scripts/test-multigrain.sh "$kernel_version/arch/arm64/boot/Image"

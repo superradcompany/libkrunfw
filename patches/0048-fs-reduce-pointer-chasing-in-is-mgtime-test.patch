@@ -1,0 +1,56 @@
+From 9fed2c0f2f0771b990d068ef0a2b32e770ae6d48 Mon Sep 17 00:00:00 2001
+From: Jeff Layton <jlayton@kernel.org>
+Date: Wed, 13 Nov 2024 09:17:51 -0500
+Subject: [PATCH] fs: reduce pointer chasing in is_mgtime() test
+
+The is_mgtime test checks whether the FS_MGTIME flag is set in the
+fstype. To get there from the inode though, we have to dereference 3
+pointers.
+
+Add a new IOP_MGTIME flag, and have inode_init_always() set that flag
+when the fstype flag is set. Then, make is_mgtime test for IOP_MGTIME
+instead.
+
+Signed-off-by: Jeff Layton <jlayton@kernel.org>
+Link: https://lore.kernel.org/r/20241113-mgtime-v1-1-84e256980e11@kernel.org
+Reviewed-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+---
+ fs/inode.c         | 2 ++
+ include/linux/fs.h | 3 ++-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/fs/inode.c b/fs/inode.c
+index 3b66082afe22fd..bb0117e679de28 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -241,6 +241,8 @@ int inode_init_always(struct super_block *sb, struct inode *inode)
+ 	inode->i_opflags = 0;
+ 	if (sb->s_xattr)
+ 		inode->i_opflags |= IOP_XATTR;
++	if (sb->s_type->fs_flags & FS_MGTIME)
++		inode->i_opflags |= IOP_MGTIME;
+ 	i_uid_write(inode, 0);
+ 	i_gid_write(inode, 0);
+ 	atomic_set(&inode->i_writecount, 0);
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index b1a3bd07711bae..a9c6c8cbda5025 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -623,6 +623,7 @@ is_uncached_acl(struct posix_acl *acl)
+ #define IOP_NOFOLLOW	0x0004
+ #define IOP_XATTR	0x0008
+ #define IOP_DEFAULT_READLINK	0x0010
++#define IOP_MGTIME	0x0020
+ 
+ /*
+  * Keep mostly read-only and often accessed (especially for
+@@ -2581,7 +2582,7 @@ struct file_system_type {
+  */
+ static inline bool is_mgtime(const struct inode *inode)
+ {
+-	return inode->i_sb->s_type->fs_flags & FS_MGTIME;
++	return inode->i_opflags & IOP_MGTIME;
+ }
+ 
+ extern struct dentry *mount_bdev(struct file_system_type *fs_type,
