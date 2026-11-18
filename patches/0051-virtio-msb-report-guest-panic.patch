@@ -1,0 +1,67 @@
+Subject: [PATCH] virtio: report guest panic before shutdown through microsandbox MMIO
+
+Provide an allocation-free synchronous notification when the host advertises
+the panic register. Older guests and hosts retain their exit behavior.
+
+diff --git a/drivers/virtio/virtio_msb_metrics.c b/drivers/virtio/virtio_msb_metrics.c
+--- a/drivers/virtio/virtio_msb_metrics.c
++++ b/drivers/virtio/virtio_msb_metrics.c
+@@ -10,6 +10,7 @@
+ #include <linux/mutex.h>
+ #include <linux/namei.h>
+ #include <linux/overflow.h>
++#include <linux/panic_notifier.h>
+ #include <linux/path.h>
+ #include <linux/scatterlist.h>
+ #include <linux/slab.h>
+@@ -37,6 +38,7 @@
+ 	struct mutex path_lock; /* Protects upper_path registration. */
+ 	spinlock_t vq_lock; /* Protects sample_in_flight and virtqueue updates. */
+ 	struct delayed_work sample_work;
++	struct notifier_block panic_nb;
+ 	struct path upper_path;
+ 	bool upper_path_registered;
+ 	bool sample_in_flight;
+@@ -202,6 +204,25 @@
+ 	spin_unlock_irqrestore(&mdev->vq_lock, flags);
+ }
+ 
++/* In panic context the workqueue and virtqueue may both be unavailable.
++ * The MMIO signature keeps the write conditional on host support and does
++ * not add a negotiated virtio feature to existing full checkpoints.
++ */
++static int msb_metrics_panic(struct notifier_block *nb, unsigned long event,
++                             void *data)
++{
++	struct msb_metrics_dev *mdev = container_of(nb, struct msb_metrics_dev,
++						   panic_nb);
++	struct virtio_device *vdev = mdev->vdev;
++	static const u8 panic_signature[4] = { 'P', 'N', 'C', '1' };
++	u32 response = 0;
++
++	vdev->config->get(vdev, 0, &response, sizeof(response));
++	if (!memcmp(&response, panic_signature, sizeof(response)))
++		vdev->config->set(vdev, 4, &response, sizeof(response));
++	return NOTIFY_DONE;
++}
++
+ static int msb_metrics_probe(struct virtio_device *vdev)
+ {
+ 	struct msb_metrics_dev *mdev;
+@@ -245,6 +266,8 @@
+ 		goto err_put_kobj;
+ 
+ 	virtio_device_ready(vdev);
++	mdev->panic_nb.notifier_call = msb_metrics_panic;
++	atomic_notifier_chain_register(&panic_notifier_list, &mdev->panic_nb);
+ 
+ 	return 0;
+ 
+@@ -266,6 +289,7 @@
+ {
+ 	struct msb_metrics_dev *mdev = vdev->priv;
+ 
++	atomic_notifier_chain_unregister(&panic_notifier_list, &mdev->panic_nb);
+ 	cancel_delayed_work_sync(&mdev->sample_work);
+ 
+ 	if (msb_metrics_kobj) {
