@@ -6,66 +6,64 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-  issues: write
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: kernel-version-monitor
+  cancel-in-progress: false
 
 jobs:
   check:
-    name: Check stable kernel version
+    name: Update stable kernel pull request
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Code checkout
         uses: actions/checkout@v7
+        with:
+          # Manual runs must also prepare the update against the default branch.
+          ref: ${{ github.event.repository.default_branch }}
 
-      - name: Check pinned kernel
+      - name: Prepare kernel update
         id: kernel
-        shell: bash
-        run: |
-          set +e
-          output=$(scripts/check-kernel-version.sh)
-          status=$?
-          set -e
-          printf '%s\n' "$output"
-          while IFS='=' read -r key value; do
-            if [[ $key == "current" || $key == "latest" ]]; then
-              echo "$key=$value" >> "$GITHUB_OUTPUT"
-            fi
-          done <<< "$output"
-          echo "status=$status" >> "$GITHUB_OUTPUT"
+        run: scripts/check-kernel-version.sh --update >> "$GITHUB_OUTPUT"
 
-      - name: Open kernel update issue
-        if: steps.kernel.outputs.status == '1'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CURRENT_VERSION: ${{ steps.kernel.outputs.current }}
-          LATEST_VERSION: ${{ steps.kernel.outputs.latest }}
-        run: |
-          issue_title="Kernel stable update available"
-          issue_number=$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" --jq ".[] | select((has(\"pull_request\") | not) and .title == \"$issue_title\") | .number" | head -n 1)
-          if [[ -n $issue_number ]]; then
-            echo "Issue #$issue_number already tracks the available update"
-            exit 0
-          fi
-          printf -v issue_body 'libkrunfw pins Linux %s, but Linux %s is now available in the same stable series. Update `KERNEL_VERSION`, apply every common and TEE patch, and let Kernel CI build all six configurations before merging.\n\nDetected by [this scheduled run](%s/%s/actions/runs/%s).' "$CURRENT_VERSION" "$LATEST_VERSION" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
-          gh issue create \
-            --title "$issue_title" \
-            --body "$issue_body"
+      # Run even without an update so an obsolete PR is closed after a manual bump.
+      - name: Open or update kernel pull request
+        id: pull-request
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ github.token }}
+          branch: appcypher/kernel-stable-update
+          base: ${{ github.event.repository.default_branch }}
+          add-paths: Makefile
+          sign-commits: true
+          delete-branch: true
+          commit-message: "fix(kernel): update Linux to ${{ steps.kernel.outputs.latest }}"
+          title: "fix(kernel): update Linux to ${{ steps.kernel.outputs.latest }}"
+          body: |
+            Update the pinned Linux kernel from ${{ steps.kernel.outputs.current }} to ${{ steps.kernel.outputs.latest }} within the same stable series.
 
-      - name: Close resolved kernel update issue
-        if: steps.kernel.outputs.status == '0'
+            Kernel CI is dispatched for this PR revision to apply the common and TEE patches and build Linux x86_64, Windows x86_64, SEV x86_64, TDX x86_64, Linux aarch64, and Linux riscv64.
+
+            Review the build results and merge manually. This automation does not enable auto-merge. The daily monitor maintains this branch; prepare any patch repairs on a separate branch.
+
+      - name: Verify signed update commits
+        if: steps.kernel.outputs.current != steps.kernel.outputs.latest && steps.pull-request.outputs.pull-request-number
         env:
-          GH_TOKEN: ${{ github.token }}
+          COMMITS_VERIFIED: ${{ steps.pull-request.outputs.pull-request-commits-verified }}
         run: |
-          issue_title="Kernel stable update available"
-          issue_number=$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" --jq ".[] | select((has(\"pull_request\") | not) and .title == \"$issue_title\") | .number" | head -n 1)
-          if [[ -n $issue_number ]]; then
-            gh issue close "$issue_number" --comment "The pinned kernel now matches the latest stable release in its series."
+          if [[ $COMMITS_VERIFIED != true ]]; then
+            echo "Kernel update commits must have verified signatures" >&2
+            exit 1
           fi
 
-      - name: Fail when the kernel check did not pass
-        if: steps.kernel.outputs.status != '0'
+      - name: Run all kernel builds for the update
+        if: steps.kernel.outputs.current != steps.kernel.outputs.latest && steps.pull-request.outputs.pull-request-number
         env:
-          CHECK_STATUS: ${{ steps.kernel.outputs.status }}
-        run: |
-          echo "Kernel version check failed with status $CHECK_STATUS" >&2
-          exit 1
+          GH_TOKEN: ${{ github.token }}
+          UPDATE_BRANCH: ${{ steps.pull-request.outputs.pull-request-branch }}
+          UPDATE_HEAD_SHA: ${{ steps.pull-request.outputs.pull-request-head-sha }}
+        run: bash scripts/dispatch-kernel-ci.sh "$UPDATE_BRANCH" "$UPDATE_HEAD_SHA"

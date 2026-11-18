@@ -13,6 +13,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  config-parity:
+    name: Check Windows kernel feature parity
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v7
+
+      - name: Compare generic and Windows x86_64 configs
+        run: python3 -m unittest discover -s tests -p test_kernel_config.py -v
+
   bundle-reuse:
     name: Check cached kernel bundles
     runs-on: ubuntu-24.04
@@ -35,12 +45,15 @@ jobs:
       - name: Code checkout
         uses: actions/checkout@v7
 
+      - name: Test kernel update automation
+        run: python3 -m unittest discover -s tests -p test_kernel_update.py -v
+
       - name: Check pinned kernel
         run: scripts/check-kernel-version.sh
 
   source:
     name: Fetch kernel source
-    needs: freshness
+    needs: [freshness, config-parity]
     runs-on: ubuntu-24.04
     steps:
       - name: Code checkout
@@ -115,3 +128,10 @@ jobs:
         env:
           MAKE_ARGS: ${{ matrix.make_args }}
         run: make -j"$(nproc)" $MAKE_ARGS kernel.c
+
+      - name: Test multigrain timestamps in the ARM64 guest
+        if: matrix.name == 'Linux aarch64'
+        run: |
+          sudo apt-get install -y --no-install-recommends busybox-static qemu-system-arm e2fsprogs xfsprogs btrfs-progs
+          kernel_version=$(awk '$1 == "KERNEL_VERSION" { print $3; exit }' Makefile)
+          scripts/test-multigrain.sh "$kernel_version/arch/arm64/boot/Image"

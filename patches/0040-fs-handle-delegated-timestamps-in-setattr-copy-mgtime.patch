@@ -1,0 +1,181 @@
+From 7f2c86cba3c584c7227cddaabdf0ab54c8151e60 Mon Sep 17 00:00:00 2001
+From: Jeff Layton <jlayton@kernel.org>
+Date: Wed, 2 Oct 2024 17:27:20 -0400
+Subject: [PATCH] fs: handle delegated timestamps in setattr_copy_mgtime
+
+An update to the inode ctime typically requires the latest clock
+value possible. The exception to this rule is when there is a nfsd write
+delegation and the server is proxying timestamps from the client.
+
+When nfsd gets a CB_GETATTR response, update the timestamp value in the
+inode to the values that the client is tracking. The client doesn't send
+a ctime value (since that's always determined by the exported
+filesystem), but it can send a mtime value. In the case where it does,
+update the ctime to a value commensurate with that instead of the
+current time.
+
+If ATTR_DELEG is set, then use ia_ctime value instead of setting the
+timestamp to the current time.
+
+With the addition of delegated timestamps, the server may receive a
+request to update only the atime, which doesn't involve a ctime update.
+Trust the ATTR_CTIME flag in the update and only update the ctime when
+it's set.
+
+Tested-by: Randy Dunlap <rdunlap@infradead.org> # documentation bits
+Reviewed-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Jeff Layton <jlayton@kernel.org>
+Link: https://lore.kernel.org/r/20241002-mgtime-v10-5-d1c4717f5284@kernel.org
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+---
+ fs/attr.c          | 29 +++++++++++-------
+ fs/inode.c         | 73 ++++++++++++++++++++++++++++++++++++++++++++++
+ include/linux/fs.h |  2 ++
+ 3 files changed, 94 insertions(+), 10 deletions(-)
+
+diff --git a/fs/attr.c b/fs/attr.c
+index 0309c2bd8afa04..9caf63d20d03e8 100644
+--- a/fs/attr.c
++++ b/fs/attr.c
+@@ -286,16 +286,21 @@ static void setattr_copy_mgtime(struct inode *inode, const struct iattr *attr)
+ 	unsigned int ia_valid = attr->ia_valid;
+ 	struct timespec64 now;
+ 
+-	/*
+-	 * If the ctime isn't being updated then nothing else should be
+-	 * either.
+-	 */
+-	if (!(ia_valid & ATTR_CTIME)) {
+-		WARN_ON_ONCE(ia_valid & (ATTR_ATIME|ATTR_MTIME));
+-		return;
++	if (ia_valid & ATTR_CTIME) {
++		/*
++		 * In the case of an update for a write delegation, we must respect
++		 * the value in ia_ctime and not use the current time.
++		 */
++		if (ia_valid & ATTR_DELEG)
++			now = inode_set_ctime_deleg(inode, attr->ia_ctime);
++		else
++			now = inode_set_ctime_current(inode);
++	} else {
++		/* If ATTR_CTIME isn't set, then ATTR_MTIME shouldn't be either. */
++		WARN_ON_ONCE(ia_valid & ATTR_MTIME);
++		now = current_time(inode);
+ 	}
+ 
+-	now = inode_set_ctime_current(inode);
+ 	if (ia_valid & ATTR_ATIME_SET)
+ 		inode_set_atime_to_ts(inode, attr->ia_atime);
+ 	else if (ia_valid & ATTR_ATIME)
+@@ -354,8 +359,12 @@ void setattr_copy(struct mnt_idmap *idmap, struct inode *inode,
+ 		inode_set_atime_to_ts(inode, attr->ia_atime);
+ 	if (ia_valid & ATTR_MTIME)
+ 		inode_set_mtime_to_ts(inode, attr->ia_mtime);
+-	if (ia_valid & ATTR_CTIME)
+-		inode_set_ctime_to_ts(inode, attr->ia_ctime);
++	if (ia_valid & ATTR_CTIME) {
++		if (ia_valid & ATTR_DELEG)
++			inode_set_ctime_deleg(inode, attr->ia_ctime);
++		else
++			inode_set_ctime_to_ts(inode, attr->ia_ctime);
++	}
+ }
+ EXPORT_SYMBOL(setattr_copy);
+ 
+diff --git a/fs/inode.c b/fs/inode.c
+index 53f56f6e1ff26e..7d1ede60e54968 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -2717,6 +2717,79 @@ struct timespec64 inode_set_ctime_current(struct inode *inode)
+ }
+ EXPORT_SYMBOL(inode_set_ctime_current);
+ 
++/**
++ * inode_set_ctime_deleg - try to update the ctime on a delegated inode
++ * @inode: inode to update
++ * @update: timespec64 to set the ctime
++ *
++ * Attempt to atomically update the ctime on behalf of a delegation holder.
++ *
++ * The nfs server can call back the holder of a delegation to get updated
++ * inode attributes, including the mtime. When updating the mtime, update
++ * the ctime to a value at least equal to that.
++ *
++ * This can race with concurrent updates to the inode, in which
++ * case the update is skipped.
++ *
++ * Note that this works even when multigrain timestamps are not enabled,
++ * so it is used in either case.
++ */
++struct timespec64 inode_set_ctime_deleg(struct inode *inode, struct timespec64 update)
++{
++	struct timespec64 now, cur_ts;
++	u32 cur, old;
++
++	/* pairs with try_cmpxchg below */
++	cur = smp_load_acquire(&inode->i_ctime_nsec);
++	cur_ts.tv_nsec = cur & ~I_CTIME_QUERIED;
++	cur_ts.tv_sec = inode->i_ctime_sec;
++
++	/* If the update is older than the existing value, skip it. */
++	if (timespec64_compare(&update, &cur_ts) <= 0)
++		return cur_ts;
++
++	ktime_get_coarse_real_ts64_mg(&now);
++
++	/* Clamp the update to "now" if it's in the future */
++	if (timespec64_compare(&update, &now) > 0)
++		update = now;
++
++	update = timestamp_truncate(update, inode);
++
++	/* No need to update if the values are already the same */
++	if (timespec64_equal(&update, &cur_ts))
++		return cur_ts;
++
++	/*
++	 * Try to swap the nsec value into place. If it fails, that means
++	 * it raced with an update due to a write or similar activity. That
++	 * stamp takes precedence, so just skip the update.
++	 */
++retry:
++	old = cur;
++	if (try_cmpxchg(&inode->i_ctime_nsec, &cur, update.tv_nsec)) {
++		inode->i_ctime_sec = update.tv_sec;
++		mgtime_counter_inc(mg_ctime_swaps);
++		return update;
++	}
++
++	/*
++	 * Was the change due to another task marking the old ctime QUERIED?
++	 *
++	 * If so, then retry the swap. This can only happen once since
++	 * the only way to clear I_CTIME_QUERIED is to stamp the inode
++	 * with a new ctime.
++	 */
++	if (!(old & I_CTIME_QUERIED) && (cur == (old | I_CTIME_QUERIED)))
++		goto retry;
++
++	/* Otherwise, it was a new timestamp. */
++	cur_ts.tv_sec = inode->i_ctime_sec;
++	cur_ts.tv_nsec = cur & ~I_CTIME_QUERIED;
++	return cur_ts;
++}
++EXPORT_SYMBOL(inode_set_ctime_deleg);
++
+ /**
+  * in_group_or_capable - check whether caller is CAP_FSETID privileged
+  * @idmap:	idmap of the mount @inode was found from
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index eff688e75f2f29..ea7ed437d2b165 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1544,6 +1544,8 @@ static inline bool fsuidgid_has_mapping(struct super_block *sb,
+ 
+ struct timespec64 current_time(struct inode *inode);
+ struct timespec64 inode_set_ctime_current(struct inode *inode);
++struct timespec64 inode_set_ctime_deleg(struct inode *inode,
++					struct timespec64 update);
+ 
+ static inline time64_t inode_get_atime_sec(const struct inode *inode)
+ {
