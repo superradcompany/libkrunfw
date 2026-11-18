@@ -4,6 +4,10 @@
 
 By having the kernel bundled in a dynamic library, ```libkrun``` can leave to the linker the work of mapping the sections into the process, and then directly inject those mappings into the guest without any kind of additional work nor processing.
 
+## Resource readiness
+
+The bundled guest kernel provides optional [CPU and memory readiness observations](RESOURCE_READINESS.md). Hosts must combine these with operation identity and freshness checks before reporting resize completion.
+
 ## Building
 
 ### Linux (generic variant)
