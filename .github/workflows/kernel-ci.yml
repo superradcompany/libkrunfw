@@ -235,22 +235,26 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Refuse an existing commit tag
+      - name: Check for existing commit tag
+        id: existing
         run: |
           set -euo pipefail
           error_file=$(mktemp)
           if docker buildx imagetools inspect "$IMAGE:$GITHUB_SHA" >/dev/null 2>"$error_file"; then
-            echo "::error::$IMAGE:$GITHUB_SHA already exists and will not be overwritten."
-            exit 1
+            echo "::notice::$IMAGE:$GITHUB_SHA already exists; keeping existing image."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           if ! grep -Eqi 'not found|manifest unknown' "$error_file"; then
             cat "$error_file" >&2
             echo "::error::Unable to determine whether $IMAGE:$GITHUB_SHA already exists."
             exit 1
           fi
+          echo "exists=false" >> "$GITHUB_OUTPUT"
 
       - name: Build and push multi-arch OCI image
         id: push
+        if: steps.existing.outputs.exists != 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: oci
@@ -267,19 +271,21 @@ jobs:
 
       - name: Verify published manifest
         env:
-          DIGEST: ${{ steps.push.outputs.digest }}
+          PUSHED_DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           set -euo pipefail
           inspection=$(docker buildx imagetools inspect "$IMAGE:$GITHUB_SHA")
-          if [[ -z "$DIGEST" ]] ||
+          digest=$(awk '$1 == "Digest:" { print $2; exit }' <<<"$inspection")
+          if [[ -z "$digest" ]] ||
+            { [[ -n "$PUSHED_DIGEST" ]] && [[ "$digest" != "$PUSHED_DIGEST" ]]; } ||
             ! grep -Fq 'linux/amd64' <<<"$inspection" ||
             ! grep -Fq 'linux/arm64' <<<"$inspection"; then
             echo "$inspection"
-            echo "::error::Published manifest did not contain both expected platforms."
+            echo "::error::Published manifest did not match expected platforms or digest."
             exit 1
           fi
           {
             echo "## Published"
             echo
-            echo "- Image: \`$IMAGE:$GITHUB_SHA@$DIGEST\`"
+            echo "- Image: \`$IMAGE:$GITHUB_SHA@$digest\`"
           } >> "$GITHUB_STEP_SUMMARY"
