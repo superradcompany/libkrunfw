@@ -12,7 +12,7 @@ permissions:
 
 concurrency:
   group: kernel-ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   config-parity:
@@ -89,26 +89,32 @@ jobs:
             runner: ubuntu-24.04
             packages: ""
             make_args: ""
+            oci_arch: amd64
           - name: Windows x86_64
             runner: ubuntu-24.04
             packages: ""
             make_args: OS=Windows
+            oci_arch: ""
           - name: SEV x86_64
             runner: ubuntu-24.04
             packages: ""
             make_args: SEV=1
+            oci_arch: ""
           - name: TDX x86_64
             runner: ubuntu-24.04
             packages: ""
             make_args: TDX=1
+            oci_arch: ""
           - name: Linux aarch64
             runner: ubuntu-24.04-arm
             packages: ""
             make_args: ""
+            oci_arch: arm64
           - name: Linux riscv64
             runner: ubuntu-24.04
             packages: gcc-riscv64-linux-gnu
             make_args: ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu-
+            oci_arch: ""
     steps:
       - name: Code checkout
         uses: actions/checkout@v7
@@ -129,7 +135,25 @@ jobs:
       - name: Build kernel configuration
         env:
           MAKE_ARGS: ${{ matrix.make_args }}
-        run: make -j"$(nproc)" $MAKE_ARGS kernel.c
+          OCI_ARCH: ${{ matrix.oci_arch }}
+        run: |
+          if [[ -n "$OCI_ARCH" ]]; then
+            make -j"$(nproc)" $MAKE_ARGS
+          else
+            make -j"$(nproc)" $MAKE_ARGS kernel.c
+          fi
+
+      - name: Upload shared library
+        if: >-
+          matrix.oci_arch != '' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          github.ref == 'refs/heads/cloud-krunfw'
+        uses: actions/upload-artifact@v7
+        with:
+          name: libkrunfw-linux-${{ matrix.oci_arch }}
+          path: libkrunfw.so.*.*.*
+          retention-days: 1
+          if-no-files-found: error
 
       - name: Test multigrain timestamps in the ARM64 guest
         if: matrix.name == 'Linux aarch64'
@@ -137,3 +161,125 @@ jobs:
           sudo apt-get install -y --no-install-recommends busybox-static qemu-system-arm e2fsprogs xfsprogs btrfs-progs
           kernel_version=$(awk '$1 == "KERNEL_VERSION" { print $3; exit }' Makefile)
           scripts/test-multigrain.sh "$kernel_version/arch/arm64/boot/Image"
+
+  publish:
+    name: Publish OCI image
+    needs: [build]
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/cloud-krunfw'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/superradcompany/libkrunfw-cloud
+    steps:
+      - name: Code checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Read build metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          full_version=$(awk '$1 == "FULL_VERSION" { print $3; exit }' Makefile)
+          kernel_version=$(awk '$1 == "KERNEL_VERSION" { sub(/^linux-/, "", $3); print $3; exit }' Makefile)
+          if [[ -z "$full_version" || -z "$kernel_version" ]]; then
+            echo "::error::Could not parse FULL_VERSION or KERNEL_VERSION from Makefile"
+            exit 1
+          fi
+          echo "full_version=$full_version" >> "$GITHUB_OUTPUT"
+          echo "kernel_version=$kernel_version" >> "$GITHUB_OUTPUT"
+
+      - name: Download amd64 shared library
+        uses: actions/download-artifact@v8
+        with:
+          name: libkrunfw-linux-amd64
+          path: oci/build/amd64
+
+      - name: Download arm64 shared library
+        uses: actions/download-artifact@v8
+        with:
+          name: libkrunfw-linux-arm64
+          path: oci/build/arm64
+
+      - name: Stage OCI context
+        env:
+          FULL_VERSION: ${{ steps.meta.outputs.full_version }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            file="oci/build/$arch/libkrunfw.so.$FULL_VERSION"
+            if [[ ! -f "$file" ]]; then
+              echo "::error::Missing $file"
+              exit 1
+            fi
+            chmod 0644 "$file"
+            sha256sum "$file"
+          done
+          cat <<'EOF' > oci/Dockerfile
+          FROM scratch
+          ARG TARGETARCH
+          COPY build/${TARGETARCH}/libkrunfw.so.* /usr/local/lib/
+          CMD ["/"]
+          EOF
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse an existing commit tag
+        run: |
+          set -euo pipefail
+          error_file=$(mktemp)
+          if docker buildx imagetools inspect "$IMAGE:$GITHUB_SHA" >/dev/null 2>"$error_file"; then
+            echo "::error::$IMAGE:$GITHUB_SHA already exists and will not be overwritten."
+            exit 1
+          fi
+          if ! grep -Eqi 'not found|manifest unknown' "$error_file"; then
+            cat "$error_file" >&2
+            echo "::error::Unable to determine whether $IMAGE:$GITHUB_SHA already exists."
+            exit 1
+          fi
+
+      - name: Build and push multi-arch OCI image
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: oci
+          file: oci/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.full_version }}
+            org.microsandbox.kernel.version=${{ steps.meta.outputs.kernel_version }}
+
+      - name: Verify published manifest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          inspection=$(docker buildx imagetools inspect "$IMAGE:$GITHUB_SHA")
+          if [[ -z "$DIGEST" ]] ||
+            ! grep -Fq 'linux/amd64' <<<"$inspection" ||
+            ! grep -Fq 'linux/arm64' <<<"$inspection"; then
+            echo "$inspection"
+            echo "::error::Published manifest did not contain both expected platforms."
+            exit 1
+          fi
+          {
+            echo "## Published"
+            echo
+            echo "- Image: \`$IMAGE:$GITHUB_SHA@$DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
