@@ -18,7 +18,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y make gcc bc bison flex elfutils python3-pyelftools curl patch libelf-dev cpio xz-utils
+        run: sudo apt-get update && sudo apt-get install -y make gcc bc bison flex elfutils python3-pyelftools curl patch libelf-dev cpio xz-utils dwarves
 
       - name: Extract version from Makefile
         id: version
@@ -53,7 +53,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y make gcc bc bison flex elfutils python3-pyelftools curl patch libelf-dev cpio xz-utils
+        run: sudo apt-get update && sudo apt-get install -y make gcc bc bison flex elfutils python3-pyelftools curl patch libelf-dev cpio xz-utils dwarves
 
       - name: Extract version from Makefile
         id: version

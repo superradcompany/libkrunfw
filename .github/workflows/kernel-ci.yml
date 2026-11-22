@@ -1,8 +1,10 @@
 name: Kernel CI
 
 on:
+  push:
+    branches: [cloud-krunfw]
   pull_request:
-    branches: [krunfw]
+    branches: [krunfw, cloud-krunfw]
   workflow_dispatch:
 
 permissions:
@@ -122,7 +124,7 @@ jobs:
           EXTRA_PACKAGES: ${{ matrix.packages }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y make gcc bc bison flex elfutils python3-pyelftools curl patch libelf-dev cpio xz-utils $EXTRA_PACKAGES
+          sudo apt-get install -y make gcc bc bison flex elfutils python3-pyelftools curl patch libelf-dev cpio xz-utils dwarves $EXTRA_PACKAGES
 
       - name: Build kernel configuration
         env:
